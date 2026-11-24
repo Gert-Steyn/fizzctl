@@ -35,10 +35,11 @@ cargo run --bin fizz-probe -- --rewrite-poll-rate
 | Polling rate (1/2/4/8 kHz) | Read and write |
 | Calibration state, supported features | Read |
 | Key lighting: effect, brightness, speed, rainbow, colours, direction | Read and write |
+| Per-key colours (Custom effect): paint keys on the keyboard drawing | Read and write |
 | Key mapping, default and Fn layers: keys, media, mouse, shortcuts, lighting controls | Read and write |
 | Actuation point and rapid trigger, per key or many keys at once | Read and write |
 | Packet log of all traffic | Yes |
-| Macros, per-key RGB, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
+| Macros, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
 | Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
 
 ### Actuation

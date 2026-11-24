@@ -81,6 +81,15 @@ pub struct KeymapWrite {
     pub verified: bool,
 }
 
+/// Result of [`Keyboard::write_colours`].
+#[derive(Clone, Debug)]
+pub struct ColourWrite {
+    pub pages: usize,
+    pub acked: usize,
+    pub stored: Option<Vec<[u8; 3]>>,
+    pub verified: bool,
+}
+
 /// Pause between trigger write packets, which the keyboard doesn't acknowledge.
 const TRIGGER_WRITE_GAP: Duration = Duration::from_millis(30);
 
@@ -337,6 +346,57 @@ impl Keyboard {
             acked,
             storing_seen,
             verified: stored.as_deref() == Some(keys),
+            stored,
+        })
+    }
+
+    /// Which colour layer (0 or 1) the Custom effect shows.
+    pub fn read_colour_layer(&mut self) -> Result<Option<u8>> {
+        let reply = self.request(
+            "colour layer",
+            &protocol::colour_layer_request(),
+            |r| r[0] == protocol::cmd::CUSTOM_COLOURS && r[1] != 0x80 && r[1] != 0x81,
+            REPLY_TIMEOUT,
+        )?;
+        Ok(protocol::parse_colour_layer(&reply))
+    }
+
+    /// Every slot's colour in `layer`. `None` when a page was missing.
+    pub fn read_colours(&mut self, layer: u8) -> Result<Option<Vec<[u8; 3]>>> {
+        let pages = self.request_pages(
+            "colours",
+            &protocol::colours_request(layer),
+            protocol::COLOUR_LAST_PAGE,
+            REPLY_TIMEOUT,
+            PAGE_IDLE,
+        )?;
+        Ok(protocol::parse_colours(layer, &pages))
+    }
+
+    /// Write a whole colour layer (each page acknowledged), then read it back.
+    pub fn write_colours(&mut self, layer: u8, colours: &[[u8; 3]]) -> Result<ColourWrite> {
+        if colours.len() != protocol::KEY_SLOTS {
+            return Err(Error::Incomplete);
+        }
+        let packets = protocol::colours_write(layer, colours);
+        let mut acked = 0;
+        for packet in &packets {
+            match self.request(
+                "colour page",
+                packet,
+                |r| r[0] == protocol::cmd::CUSTOM_COLOURS && r[1] == layer & 1,
+                ACK_TIMEOUT,
+            ) {
+                Ok(_) => acked += 1,
+                Err(Error::Timeout(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let stored = self.read_colours(layer)?;
+        Ok(ColourWrite {
+            pages: packets.len(),
+            acked,
+            verified: stored.as_deref() == Some(colours),
             stored,
         })
     }

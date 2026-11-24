@@ -31,12 +31,15 @@ cargo run --bin fizz-probe                   # read-only diagnostics, prints eve
 cargo run --bin fizz-probe -- --rewrite-keymap   # backs up both layers, writes them back unchanged, verifies
 cargo run --bin fizz-probe -- --rewrite-triggers # same for every key's actuation settings
 cargo run --bin fizz-probe -- --rewrite-poll-rate # writes the current polling rate back, verifies
+cargo run --bin fizz-probe -- --rewrite-colours [--layer 0|1]  # NOT a no-op: activates the layer and the Custom effect
+cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1   # set lighting: mode bri spd fg bg dir rainbow
 cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked  # live travel test on one key; only for agreed experiments
 cargo test                                   # unit tests (protocol + keymap)
 cargo clippy --all-targets                   # 1 expected warning, in src/graphite.rs (see below)
 ```
 
-Dev-only env vars for screenshots (not persisted): `FIZZ_PAGE=keys|actuation|lighting|packets|settings`,
+Dev-only env vars for screenshots (not persisted): `FIZZ_EFFECT=custom` (preview the Custom
+effect on the Lighting page), `FIZZ_PAGE=keys|actuation|lighting|packets|settings`,
 `FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps, 22 = Esc; key mapping and actuation),
 `FIZZ_LAYER=fn`.
 
@@ -146,11 +149,25 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   "surprise removed as it is reported as missing on the bus" (Kernel-PnP 1010). It re-enumerated by
   itself; all settings were intact afterwards (checked read-only). Stop (`[5]=3`) could not be sent.
   Not yet known whether it's the full bitmap, a missing host heartbeat, or a firmware bug.
+- **Per-key colours `0x09` (2026-11-24):** read `[1]=0x80|layer`, 8 pages × 18 RGB (slot order),
+  write `[1]=layer` (acked `[09, layer]`), active layer `[1]=0x20` → reply `[1]`. Both layers were
+  all black. **A colour write is not a no-op**: writing a layer makes it the active layer
+  (confirmed: writing layer 0 switched active 1 → 0) and, per the first test, switches the
+  lighting to the Custom effect (mode 10) with Custom's *own stored* brightness/direction (it had
+  brightness 0, so the backlight went dark). The firmware keeps settings per effect. So the app
+  always sends the lighting config right after any colour save. After the incident the lighting
+  was restored with `fizz-probe --apply-light 2 4 4 FF0000 000000 2 1` (Gert agreed) and verified;
+  that was also the first real lighting write and it read back exactly.
 - **One-key retry (2026-11-24, agreed with Gert):** Esc only, 3 s, keys idle. The keyboard acked the
   start (`21 00 00 00 01 00`), sent no travel reports, accepted stop, kept answering, and Windows
   logged no removal. So a single-key test is stable *while idle*; the first run's reset came either
-  from the full bitmap or from the report stream itself. Next step needs Esc pressed during a test:
-  `fizz-probe --travel-test 10 --key 22 --allow-blocked` (Gert runs it and presses Esc).
+  from the full bitmap or from the report stream itself.
+- **One-key test with presses (2026-11-24):** Right Ctrl (slot 122), 20 s, Gert pressing it:
+  416 reports, travel 0..340 steps (= the full 0–3.40 mm), stop accepted, no USB removal. Reports
+  are `21 00 00 00 03|05 01 row col lo hi …`, at a high rate while the key moves. So the stream
+  itself is fine; the first reset most likely came from the **61-key bitmap**. (An earlier attempt
+  with Esc was aborted because Esc interrupts Claude, see memory; still no disconnect.)
+  `fizz-probe --travel-stop` sends only the stop, for cleanup after an interrupted test.
 - Vendor app sources: `https://www.illumipc.com/app.js` (`WMJ1` + XOR `witmod-app-0x5a`);
   configs under `/config/` (`WMX1:` base64 XOR `witmod-config-0x5a`). Layout file for this board:
   `config/keys/7153USHEXYXACPARGB.json`.
@@ -163,11 +180,12 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Feature | State |
 |---|---|
 | Device overview (name, firmware, build date, product code, serial, poll rate, calibration, features) | Done, read |
-| Key lighting (effect, brightness, speed, rainbow, colours, direction) | Done. Read verified; **write not yet confirmed by Gert on the device** |
+| Key lighting (effect, brightness, speed, rainbow, colours, direction) | Done. Read and write verified (probe `--apply-light`, 2026-11-24); the GUI's Apply not yet tried by Gert |
 | Key mapping, default + Fn layers | Done. Read verified; write path verified with a no-op write. A real remap via the GUI's Save button not yet tried |
 | Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
 | Polling rate (1/2/4/8 kHz on Overview, applies immediately) | Done. No-op write verified; a real change via the GUI not yet tried |
-| Live travel test | **Blocked**: starting it reset the keyboard (see Protocol essentials) |
+| Per-key colours (Custom effect: paint keys on the Lighting page) | Done. Read verified; colour write verified (acks + read-back); lighting write verified via probe. Painting from the GUI not yet tried |
+| Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
 | Hot-plug reconnect / unplug detection | Built; unplug detection untested |
@@ -176,9 +194,12 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 ## Roadmap (in order)
 
 1. ~~Actuation and rapid trigger~~ done 2026-11-24. Follow-ups, in order:
-   - **Live travel test**: blocked after it reset the keyboard. One-key idle retry was fine. Next:
-     Gert presses Esc during a one-key test; if stable, try a few keys, then all keys with the `0x01`
-     heartbeat the vendor app sends. Each step needs Gert's OK. If it works: show a live
+   - **Live travel test**: blocked after a 61-key start reset the keyboard. One key is stable,
+     including while pressed (0–340 steps). Next, each with Gert's OK and a non-Esc key: a small
+     bitmap (e.g. 5 keys), then larger ones, to find what's safe; maybe the vendor's `0x01`
+     heartbeat matters for the full set. If only small sets are safe, the UI can test the
+     selected keys only. The worker must stream input (no `drain()`/heartbeat while testing) and
+     always send `[5]=3` on stop, page change and shutdown. If it works: show a live
      bar per key on the drawing; the worker must stream input (no `drain()`/heartbeat while testing)
      and always send `[5]=3` on stop, page change and shutdown.
    - **Calibration**: `[5]=8 [6]=0/1` start/stop all keys, `[5]=7 row col` one key, `[5]=0x0F/0x10`
@@ -186,9 +207,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
      `[7..0x1D]`), 2/4 failed. Treat as behaviour-changing: ask Gert first.
    - Reset to defaults `[5]=6` (unknown defaults; ask first). Presets/quick buttons (e.g. "Gaming 0.4 mm").
 2. ~~Polling rate setting~~ done 2026-11-24.
-3. **Per-key RGB.** `0x09`: read `[1]=0x80/0x81` (two layers), write `[1]=layer`, pages 0–7 of
-   54 bytes (18 keys × RGB, index = `18*page + i`), ack `[0]=9,[1]=layer`. "Custom" effect = mode 10.
-   Paint keys on the keyboard drawing.
+3. ~~Per-key RGB~~ done 2026-11-24 (edits the active colour layer only). Possible follow-ups:
+   switch between the two colour layers (writing a layer activates it), drag-to-paint, presets.
 4. **Macros.** `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
    delete `[1]=3 [4]=index`. Step = `{keyCode, type|state<<4, delayHi, delayLo}`. Key-map kind `0x10`
    with `arg1` = macro index. Needs a recorder UI.

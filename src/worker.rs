@@ -25,6 +25,8 @@ pub enum Request {
     /// Actuation settings, grouped: each setting with the slots it applies to.
     SaveTriggers(Vec<(KeyTrigger, Vec<usize>)>),
     SetPollRate(u32),
+    /// Per-key colours for colour layer 0 or 1.
+    SaveColours(u8, Vec<[u8; 3]>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +42,9 @@ pub struct Snapshot {
     pub trigger_config: Option<TriggerConfig>,
     /// Actuation per slot (`KEY_SLOTS` long); `None` for empty slots or keys that didn't answer.
     pub triggers: Option<Vec<Option<KeyTrigger>>>,
+    /// The colour layer the Custom effect shows, and its per-slot colours.
+    pub colour_layer: Option<u8>,
+    pub colours: Option<Vec<[u8; 3]>>,
 }
 
 pub struct LogEntry {
@@ -57,6 +62,7 @@ pub enum Update {
     TriggersSaved(Vec<(usize, Option<KeyTrigger>)>),
     /// The polling rate read back after setting it.
     PollRateSet(Option<u32>),
+    ColoursSaved(u8, Vec<[u8; 3]>),
     Error(String),
     Packet(LogEntry),
 }
@@ -114,7 +120,8 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
                     Request::ApplyLight(_)
                     | Request::SaveKeymap(..)
                     | Request::SaveTriggers(_)
-                    | Request::SetPollRate(_),
+                    | Request::SetPollRate(_)
+                    | Request::SaveColours(..),
                 ) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
@@ -149,6 +156,7 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
             Ok(Request::SaveKeymap(layer, keys)) => save_keymap(keyboard, layer, &keys, &link),
             Ok(Request::SaveTriggers(groups)) => save_triggers(keyboard, &groups, &link),
             Ok(Request::SetPollRate(hz)) => set_poll_rate(keyboard, hz, &link),
+            Ok(Request::SaveColours(layer, colours)) => save_colours(keyboard, layer, &colours, &link),
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -269,6 +277,40 @@ fn set_poll_rate(kb: &mut Keyboard, hz: u32, link: &Link) -> fizz::device::Resul
     Ok(())
 }
 
+fn save_colours(
+    kb: &mut Keyboard,
+    layer: u8,
+    colours: &[[u8; 3]],
+    link: &Link,
+) -> fizz::device::Result<()> {
+    let result = match kb.write_colours(layer, colours) {
+        Ok(r) => r,
+        Err(fizz::device::Error::Incomplete) => {
+            link.send(Update::Error("The key colours are incomplete, so they weren't saved.".into()));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    match result.stored {
+        Some(stored) => {
+            link.send(Update::ColoursSaved(layer, stored));
+            if !result.verified {
+                link.send(Update::Error(
+                    "The keyboard saved different key colours than were sent. The page now shows what it stored."
+                        .into(),
+                ));
+            }
+        }
+        None => {
+            link.send(Update::Error(
+                "Couldn't read the key colours back after saving. Read the keyboard again to check them."
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_triggers(kb: &mut Keyboard) -> Option<Vec<Option<KeyTrigger>>> {
     let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
     let read = kb.read_key_triggers(&slots).ok()?;
@@ -308,6 +350,8 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
     let high_precision = status.as_ref().is_some_and(|s| s.support.high_precision);
     let trigger_config = kb.read_trigger_config(high_precision).ok().flatten();
     let triggers = read_triggers(kb);
+    let colour_layer = kb.read_colour_layer().ok().flatten();
+    let colours = colour_layer.and_then(|layer| kb.read_colours(layer).ok().flatten());
     Snapshot {
         status,
         product,
@@ -319,5 +363,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         keymap_fn,
         trigger_config,
         triggers,
+        colour_layer,
+        colours,
     }
 }

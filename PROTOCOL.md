@@ -173,8 +173,22 @@ After writing key maps, poll `0x01` until the "storing" bit (`s[17]` bit 1, i.e.
   removed… missing on the bus"); it reconnected by itself with settings intact. The app refuses to
   send this command.
   A retry with only Esc in the bitmap (keys idle, 3 s) was stable: the keyboard acked the start with
-  `21 00 00 00 01 00`, accepted stop, and stayed connected.
+  `21 00 00 00 01 00`, accepted stop, and stayed connected. With only Right Ctrl and the key being
+  pressed for 20 s it streamed 416 reports covering travel 0–340 steps (the full 3.40 mm) and stayed
+  connected. So the stream is fine; the reset is most likely caused by the 61-key bitmap.
 * Not built yet: `[5]=6` reset, calibration `[5]=7/8/0x0F/0x10` (pushes progress as `0x21 [5]=7/8/0x0F`).
+
+## Per-key colours (`0x09`), confirmed on the real keyboard
+
+* Two colour layers (the vendor app's "colour 1" and "colour 2"). Active layer: `09 20` → reply `[1]`.
+* Read `[1]=0x80|layer`: pages 0–7, 18 keys × RGB per page (54 bytes, last page 18), in key-map slot
+  order (`22*row + col`).
+* Write `[1]=layer`, same pages; each page is acked `[09, layer]`.
+* **Side effects:** writing a layer makes it the active layer, and switches the lighting to the
+  Custom effect (mode 10), which keeps its own brightness/direction (it was brightness 0, so the
+  keys went dark). Always send the light config after a colour write.
+* The keyboard's mode list (`0x0A`) leaves out Custom (10); the vendor app adds it when the status
+  per-key-RGB flag is set.
 
 ## Polling rate
 

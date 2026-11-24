@@ -9,6 +9,7 @@ use fizz::protocol::{self as p, Layer, LightConfig};
 
 use crate::graphite::{self, Tone, Type, size, space};
 use crate::actuation_page::ActuationPage;
+use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::keymap_page::{KeymapPage, Outcome};
 use crate::worker::{LogEntry, Request, Snapshot, Update, Worker};
 
@@ -84,6 +85,11 @@ pub struct FizzApp {
     keymap: KeymapPage,
     actuation: ActuationPage,
     applying: bool,
+    /// Per-key colours being edited (Custom effect); `None` until read.
+    colour_edit: Option<Vec<[u8; 3]>>,
+    /// Colour that clicking a key paints with.
+    brush: [u8; 3],
+    saving_colours: bool,
     /// Polling rate being set, while waiting for the keyboard to confirm.
     setting_poll_rate: Option<u32>,
     notice: Option<(Notice, Instant)>,
@@ -134,6 +140,9 @@ impl FizzApp {
             keymap,
             actuation,
             applying: false,
+            colour_edit: None,
+            brush: [0xFF, 0xFF, 0xFF],
+            saving_colours: false,
             setting_poll_rate: None,
             notice: None,
             log: VecDeque::new(),
@@ -153,6 +162,8 @@ impl FizzApp {
                     self.snapshot = None;
                     self.light_edit = None;
                     self.applying = false;
+                    self.colour_edit = None;
+                    self.saving_colours = false;
                     self.keymap.reset();
                     self.actuation.reset();
                 }
@@ -161,6 +172,16 @@ impl FizzApp {
                     // Keep unsaved edits; otherwise follow the keyboard.
                     if self.light_edit.is_none() || self.light_edit == device_light {
                         self.light_edit = snapshot.light;
+                        // Developer override for screenshots: preview the Custom effect.
+                        if std::env::var("FIZZ_EFFECT").is_ok_and(|v| v == "custom")
+                            && let Some(edit) = self.light_edit.as_mut()
+                        {
+                            edit.mode = p::CUSTOM_LIGHT_MODE;
+                        }
+                    }
+                    let device_colours = self.snapshot.as_ref().and_then(|s| s.colours.clone());
+                    if self.colour_edit.is_none() || self.colour_edit == device_colours {
+                        self.colour_edit = snapshot.colours.clone();
                     }
                     self.keymap.on_snapshot(&snapshot);
                     self.actuation.on_snapshot(&snapshot);
@@ -196,6 +217,16 @@ impl FizzApp {
                     self.actuation.on_saved(stored);
                     self.notify(Notice::Success("Actuation saved to the keyboard.".into()));
                 }
+                Update::ColoursSaved(_layer, stored) => {
+                    if let Some(s) = self.snapshot.as_mut() {
+                        s.colours = Some(stored.clone());
+                    }
+                    self.colour_edit = Some(stored);
+                    self.saving_colours = false;
+                    if !self.applying {
+                        self.notify(Notice::Success("Key colours saved to the keyboard.".into()));
+                    }
+                }
                 Update::PollRateSet(stored) => {
                     if let Some(s) = self.snapshot.as_mut() {
                         s.poll_rate_hz = stored;
@@ -209,6 +240,7 @@ impl FizzApp {
                 }
                 Update::Error(message) => {
                     self.setting_poll_rate = None;
+                    self.saving_colours = false;
                     self.applying = false;
                     self.keymap.on_error();
                     self.actuation.on_error();
@@ -457,19 +489,29 @@ impl FizzApp {
             .then(|| self.refresh());
             return;
         };
-        let (modes, max_brightness, max_speed) = match &snap.modes {
+        let (mut modes, max_brightness, max_speed) = match &snap.modes {
             Some(m) => (m.modes.clone(), m.max_brightness, m.max_speed),
             None => (vec![edit.mode], 4, 4),
         };
+        // The keyboard's mode list leaves out Custom; the vendor app adds it
+        // when the keyboard reports per-key RGB support.
+        let custom_supported = snap.status.as_ref().is_some_and(|s| s.support.custom_light)
+            && snap.colours.is_some();
+        if custom_supported && !modes.contains(&p::CUSTOM_LIGHT_MODE) {
+            modes.push(p::CUSTOM_LIGHT_MODE);
+        }
         let p = graphite::palette(ui);
+        let busy = self.applying || self.saving_colours;
+        let colours_changed = self.colour_edit.is_some() && self.colour_edit != snap.colours;
 
         ui.horizontal(|ui| {
             section_heading(ui, "Key lighting");
-            if edit != device_light {
+            if edit != device_light || colours_changed {
                 graphite::badge(ui, "Unsaved changes", Tone::Accent);
             }
         });
-        ui.add_enabled_ui(!self.applying, |ui| {
+        let custom = edit.mode == p::CUSTOM_LIGHT_MODE;
+        ui.add_enabled_ui(!busy, |ui| {
             graphite::card(ui, |ui| {
                 graphite::setting_row(ui, "Effect", None, |ui| {
                     egui::ComboBox::from_id_salt("effect")
@@ -484,6 +526,9 @@ impl FizzApp {
                 graphite::setting_row(ui, "Brightness", None, |ui| {
                     ui.add(egui::Slider::new(&mut edit.brightness, 0..=max_brightness));
                 });
+                if custom {
+                    return;
+                }
                 graphite::divider(ui);
                 graphite::setting_row(ui, "Speed", Some("For animated effects."), |ui| {
                     ui.add(egui::Slider::new(&mut edit.speed, 0..=max_speed));
@@ -526,18 +571,38 @@ impl FizzApp {
         });
         self.light_edit = Some(edit);
 
+        if custom {
+            ui.add_space(space::S6);
+            ui.add_enabled_ui(!busy, |ui| self.key_colours(ui, &snap));
+        }
+
         ui.add_space(space::S5);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let changed = edit != device_light;
-                if self.applying {
+                let light_changed = edit != device_light;
+                let changed = light_changed || colours_changed;
+                if busy {
                     ui.add(egui::Spinner::new().size(size::ICON));
                     ui.label(graphite::text("Applying", Type::Body).color(p.text_secondary));
                 } else {
                     if graphite::primary_button(ui, "Apply lighting").clicked() {
                         if changed {
-                            self.applying = true;
-                            let _ = self.worker.tx.send(Request::ApplyLight(edit));
+                            // Colours first. Writing colours switches the keyboard to the
+                            // Custom effect with that effect's own stored brightness, so
+                            // the lighting settings must always follow a colour write.
+                            let mut sent_colours = false;
+                            if colours_changed
+                                && let (Some(layer), Some(colours)) =
+                                    (snap.colour_layer, self.colour_edit.clone())
+                            {
+                                self.saving_colours = true;
+                                sent_colours = true;
+                                let _ = self.worker.tx.send(Request::SaveColours(layer, colours));
+                            }
+                            if light_changed || sent_colours {
+                                self.applying = true;
+                                let _ = self.worker.tx.send(Request::ApplyLight(edit));
+                            }
                         } else {
                             self.notify(Notice::Success(
                                 "The keyboard already has these settings.".into(),
@@ -549,6 +614,7 @@ impl FizzApp {
                         .clicked()
                     {
                         self.light_edit = Some(device_light);
+                        self.colour_edit = snap.colours.clone();
                     }
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -559,6 +625,70 @@ impl FizzApp {
                 });
             });
         });
+    }
+
+    /// The Custom effect's per-key colours: a brush and the keyboard drawing.
+    fn key_colours(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let p = graphite::palette(ui);
+        let Some(mut colours) = self.colour_edit.clone() else {
+            return;
+        };
+        let stored = snap.colours.clone();
+        section_heading(ui, "Key colours");
+        graphite::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            graphite::setting_row(
+                ui,
+                "Brush",
+                Some("Click a key to paint it. Ctrl-click a key to pick up its colour."),
+                |ui| {
+                    if graphite::ghost_button(ui, "Clear all keys").clicked() {
+                        colours.fill([0, 0, 0]);
+                    }
+                    if graphite::ghost_button(ui, "Fill all keys").clicked() {
+                        for key in fizz::keymap::LAYOUT {
+                            colours[key.slot] = self.brush;
+                        }
+                    }
+                    ui.label(graphite::value_text(ui, hex_color(self.brush), true));
+                    ui.color_edit_button_srgb(&mut self.brush);
+                },
+            );
+            ui.add_space(space::S3);
+            let clicked = keyboard_view(
+                ui,
+                "colours",
+                1.0,
+                |_| false,
+                |key| {
+                    let c = colours[key.slot];
+                    KeyFace {
+                        top: String::new(),
+                        main: key.label.to_owned(),
+                        main_color: p.text,
+                        unsaved: stored.as_ref().is_some_and(|s| s[key.slot] != c),
+                        swatch: Some(c),
+                        tooltip: format!("{}: {}", key.label, hex_color(c)),
+                    }
+                },
+            );
+            if let Some(click) = clicked {
+                if click.extend {
+                    self.brush = colours[click.slot];
+                } else {
+                    colours[click.slot] = self.brush;
+                }
+            }
+            ui.add_space(space::S2);
+            ui.label(
+                graphite::text(
+                    "Black keys are off. The colours are stored on the keyboard and shown by the Custom effect.",
+                    Type::Small,
+                )
+                .color(p.text_muted),
+            );
+        });
+        self.colour_edit = Some(colours);
     }
 
     fn packets(&mut self, ui: &mut Ui) {

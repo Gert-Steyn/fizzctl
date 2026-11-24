@@ -6,14 +6,18 @@
 //! cargo run --bin fizz-probe -- --rewrite-keymap
 //! cargo run --bin fizz-probe -- --rewrite-triggers
 //! cargo run --bin fizz-probe -- --rewrite-poll-rate
+//! cargo run --bin fizz-probe -- --rewrite-colours [--layer 0|1]
+//! cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1
 //! cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked
+//! cargo run --bin fizz-probe -- --travel-stop
 //! ```
 //!
 //! `--rewrite-keymap` tests the key-map save path without changing anything:
 //! it backs up both layers to `backups/`, writes each one back unchanged, and
 //! checks that the keyboard still holds exactly the same bytes.
 //! `--rewrite-triggers` does the same for every key's actuation settings, and
-//! `--rewrite-poll-rate` for the polling rate. `--travel-test <seconds>` runs
+//! `--rewrite-poll-rate` for the polling rate, `--rewrite-colours` for both
+//! per-key colour layers. `--travel-test <seconds>` runs
 //! the live travel test (all keys, or one with `--key <slot>`), prints what the
 //! keyboard streams, and always stops it. Its start command is blocked because it
 //! reset the keyboard once; `--allow-blocked` overrides that for an agreed retry.
@@ -55,6 +59,14 @@ fn main() {
         let ok = rewrite_triggers(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
     }
+    if std::env::args().any(|a| a == "--travel-stop") {
+        // Safe cleanup if a travel test was interrupted before its stop.
+        kb.on_packet = None;
+        let stopped = kb.write_only(&p::travel_test_stop());
+        let alive = kb.request_same("status", &p::status_request(), TIMEOUT).is_ok();
+        println!("stop sent: {}, keyboard answers: {alive}", stopped.is_ok());
+        std::process::exit(if stopped.is_ok() && alive { 0 } else { 2 });
+    }
     if let Some(pos) = std::env::args().position(|a| a == "--travel-test") {
         let secs = std::env::args()
             .nth(pos + 1)
@@ -71,6 +83,19 @@ fn main() {
         };
         let allow = std::env::args().any(|a| a == "--allow-blocked");
         let ok = travel_test(&mut kb, secs, &slots, allow);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--rewrite-colours") {
+        let only = std::env::args()
+            .position(|a| a == "--layer")
+            .and_then(|i| std::env::args().nth(i + 1))
+            .and_then(|a| a.parse::<u8>().ok());
+        let ok = rewrite_colours(&mut kb, only);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--apply-light") {
+        let args: Vec<String> = std::env::args().skip(pos + 1).take(7).collect();
+        let ok = apply_light(&mut kb, &args);
         std::process::exit(if ok { 0 } else { 2 });
     }
     if std::env::args().any(|a| a == "--rewrite-poll-rate") {
@@ -202,6 +227,43 @@ fn main() {
             if keys.len() > 8 { &keys[..8] } else { &keys[..] }
         );
     }
+
+    println!("\nPer-key colours");
+    match kb.request(
+        "colour layer",
+        &p::colour_layer_request(),
+        |r| r[0] == p::cmd::CUSTOM_COLOURS && r[1] != 0x80 && r[1] != 0x81,
+        TIMEOUT,
+    ) {
+        Ok(r) => println!("  active layer: {:?}", p::parse_colour_layer(&r)),
+        Err(e) => println!("  active layer: {e}"),
+    }
+    let quiet = kb.on_packet.take();
+    for layer in 0..2u8 {
+        match kb.request_pages(
+            "colours",
+            &p::colours_request(layer),
+            p::COLOUR_LAST_PAGE,
+            TIMEOUT,
+            Duration::from_millis(300),
+        ) {
+            Ok(pages) => match p::parse_colours(layer, &pages) {
+                Some(colours) => {
+                    let mut counts = std::collections::BTreeMap::<[u8; 3], usize>::new();
+                    for key in fizz::keymap::LAYOUT {
+                        *counts.entry(colours[key.slot]).or_default() += 1;
+                    }
+                    println!(
+                        "  layer {layer}: {} pages, colours on the 61 keys: {counts:02X?}",
+                        pages.len()
+                    );
+                }
+                None => println!("  layer {layer}: incomplete, got {} pages", pages.len()),
+            },
+            Err(e) => println!("  layer {layer}: {e}"),
+        }
+    }
+    kb.on_packet = quiet;
 
     for layer in [p::Layer::Default, p::Layer::Fn] {
         println!("\nKey map: {layer:?}");
@@ -501,4 +563,129 @@ fn travel_test(kb: &mut Keyboard, secs: f32, slots: &[usize], allow_blocked: boo
     let alive = kb.request_same("status", &p::status_request(), TIMEOUT).is_ok();
     println!("  keyboard answers after stop: {alive}");
     stopped.is_ok() && alive
+}
+
+/// Write both per-key colour layers back unchanged and verify.
+fn rewrite_colours(kb: &mut Keyboard, only: Option<u8>) -> bool {
+    println!("\nReading both colour layers");
+    let mut before = Vec::new();
+    for layer in 0..2u8 {
+        match kb.read_colours(layer) {
+            Ok(Some(c)) => before.push(c),
+            Ok(None) => {
+                println!("  layer {layer}: incomplete read, stopping without writing anything");
+                return false;
+            }
+            Err(e) => {
+                println!("  layer {layer}: {e}, stopping without writing anything");
+                return false;
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = format!("backups/colours-{stamp}.txt");
+    let mut text = String::from("# Fizz per-key colour backup: 132 slots per layer, RRGGBB\n");
+    for (layer, colours) in before.iter().enumerate() {
+        text.push_str(&format!("[layer {layer}]\n"));
+        for row in colours.chunks(22) {
+            let line: Vec<String> = row
+                .iter()
+                .map(|c| format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]))
+                .collect();
+            text.push_str(&line.join(" "));
+            text.push('\n');
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all("backups").and_then(|_| std::fs::write(&path, text)) {
+        println!("  couldn't write the backup ({e}), stopping without writing anything");
+        return false;
+    }
+    println!("  backup saved to {path}");
+
+    let mut ok = true;
+    for (layer, colours) in before.iter().enumerate() {
+        if only.is_some_and(|o| o as usize != layer) {
+            continue;
+        }
+        println!("\nWriting colour layer {layer} back unchanged");
+        match kb.write_colours(layer as u8, colours) {
+            Ok(r) => {
+                println!(
+                    "  pages sent {}, acknowledged {}, read-back matches {}",
+                    r.pages, r.acked, r.verified
+                );
+                ok &= r.verified;
+            }
+            Err(e) => {
+                println!("  write failed: {e}");
+                ok = false;
+            }
+        }
+    }
+    let layer_now = kb.read_colour_layer().ok().flatten();
+    let light_now = kb
+        .request_same("light config", &p::light_config_request(p::Zone::Keys), TIMEOUT)
+        .ok()
+        .and_then(|r| p::parse_light_config(p::Zone::Keys, &r));
+    println!("\nAfter the write: active colour layer {layer_now:?}, lighting {light_now:?}");
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Set the key lighting: mode, brightness, speed, foreground RRGGBB,
+/// background RRGGBB, direction, rainbow (0/1). Keeps power and timer as read.
+fn apply_light(kb: &mut Keyboard, args: &[String]) -> bool {
+    let rgb = |s: &str| -> Option<[u8; 3]> {
+        let v = u32::from_str_radix(s, 16).ok()?;
+        Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+    };
+    let parsed = (|| {
+        Some((
+            args.first()?.parse::<u8>().ok()?,
+            args.get(1)?.parse::<u8>().ok()?,
+            args.get(2)?.parse::<u8>().ok()?,
+            rgb(args.get(3)?)?,
+            rgb(args.get(4)?)?,
+            args.get(5)?.parse::<u8>().ok()?,
+            args.get(6)?.parse::<u8>().ok()? != 0,
+        ))
+    })();
+    let Some((mode, brightness, speed, foreground, background, direction, full_color)) = parsed else {
+        println!("usage: --apply-light <mode> <brightness> <speed> <fg RRGGBB> <bg RRGGBB> <direction> <rainbow 0|1>");
+        return false;
+    };
+    let read = |kb: &mut Keyboard| {
+        kb.request_same("light config", &p::light_config_request(p::Zone::Keys), TIMEOUT)
+            .ok()
+            .and_then(|r| p::parse_light_config(p::Zone::Keys, &r))
+    };
+    let Some(before) = read(kb) else {
+        println!("\nCouldn't read the lighting, stopping without writing anything");
+        return false;
+    };
+    println!("\nLighting before: {before:?}");
+    let want = p::LightConfig {
+        mode,
+        brightness,
+        speed,
+        foreground,
+        background,
+        direction,
+        full_color,
+        power: before.power,
+        timer: before.timer,
+    };
+    if let Err(e) = kb.write_only(&p::light_config_write(p::Zone::Keys, &want)) {
+        println!("  write failed: {e}");
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let after = read(kb);
+    println!("Lighting after:  {after:?}");
+    let ok = after == Some(want);
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
 }

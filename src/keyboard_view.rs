@@ -19,6 +19,8 @@ pub struct KeyFace {
     pub main_color: Color32,
     /// Shows the unsaved-change dot.
     pub unsaved: bool,
+    /// A colour bar along the bottom of the keycap (per-key lighting).
+    pub swatch: Option<[u8; 3]>,
     pub tooltip: String,
 }
 
@@ -98,6 +100,21 @@ pub fn keyboard_view(
                 egui::pos2(rect.center().x - main.size().x / 2.0, y + top.size().y),
                 main,
                 face.main_color,
+            );
+        }
+
+        if let Some([r, g, b]) = face.swatch {
+            let colour = Color32::from_rgb(r, g, b);
+            let bar = Rect::from_min_max(
+                egui::pos2(rect.left() + space::S2, rect.bottom() - space::S2 - space::S3),
+                egui::pos2(rect.right() - space::S2, rect.bottom() - space::S2),
+            );
+            painter.rect(
+                bar,
+                radius::SM,
+                colour,
+                Stroke::new(size::BORDER, p.border),
+                StrokeKind::Inside,
             );
         }
 

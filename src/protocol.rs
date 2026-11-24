@@ -22,6 +22,7 @@ pub mod cmd {
     pub const LIGHT_MODES: u8 = 0x0A;
     pub const PRODUCT_INFO: u8 = 0x0D;
     pub const KEYMAP: u8 = 0x18;
+    pub const CUSTOM_COLOURS: u8 = 0x09;
     pub const SERIAL: u8 = 0x15;
     pub const PROFILE_TRIGGER: u8 = 0x21;
 
@@ -681,6 +682,71 @@ pub fn key_trigger_write(trigger: &KeyTrigger, slots: &[usize]) -> Packet {
     p
 }
 
+// ---------------------------------------------------------------------------
+// Per-key colours (command 0x09)
+// ---------------------------------------------------------------------------
+
+/// Keys per colour page: 54 bytes = 18 × RGB.
+const COLOURS_PER_PAGE: usize = 18;
+/// Last page of a colour layer read: 8 pages × 18 ≥ 132 slots.
+pub const COLOUR_LAST_PAGE: u16 = 7;
+
+/// Which of the two stored per-key colour layouts the "Custom" effect shows
+/// (the vendor app calls them colour 1 and colour 2).
+pub fn colour_layer_request() -> Packet {
+    let mut p = packet(cmd::CUSTOM_COLOURS);
+    p[1] = 0x20;
+    p
+}
+
+pub fn parse_colour_layer(reply: &Packet) -> Option<u8> {
+    (reply[0] == cmd::CUSTOM_COLOURS && reply[1] <= 1).then_some(reply[1])
+}
+
+/// Read every key's colour in `layer` (0 or 1); 8 pages come back.
+pub fn colours_request(layer: u8) -> Packet {
+    let mut p = packet(cmd::CUSTOM_COLOURS);
+    p[1] = 0x80 | (layer & 1);
+    p
+}
+
+/// Assemble a colour layer from its pages. `None` if a page is missing.
+pub fn parse_colours(layer: u8, pages: &[Packet]) -> Option<Vec<[u8; 3]>> {
+    let mut slots: Vec<Option<[u8; 3]>> = vec![None; KEY_SLOTS];
+    for reply in pages {
+        if reply[0] != cmd::CUSTOM_COLOURS || reply[1] != 0x80 | (layer & 1) {
+            continue;
+        }
+        let first = page(reply) as usize * COLOURS_PER_PAGE;
+        for (i, rgb) in payload(reply).as_chunks::<3>().0.iter().enumerate() {
+            if let Some(slot) = slots.get_mut(first + i) {
+                *slot = Some(*rgb);
+            }
+        }
+    }
+    slots.into_iter().collect()
+}
+
+/// Packets writing a whole colour layer. The keyboard acks each with `[09, layer]`.
+pub fn colours_write(layer: u8, colours: &[[u8; 3]]) -> Vec<Packet> {
+    let bytes: Vec<u8> = colours.iter().take(KEY_SLOTS).flatten().copied().collect();
+    bytes
+        .chunks(COLOURS_PER_PAGE * 3)
+        .enumerate()
+        .map(|(n, chunk)| {
+            let mut p = packet(cmd::CUSTOM_COLOURS);
+            p[1] = layer & 1;
+            p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+            p[4] = chunk.len() as u8;
+            p[PAYLOAD_OFFSET..PAYLOAD_OFFSET + chunk.len()].copy_from_slice(chunk);
+            p
+        })
+        .collect()
+}
+
+/// The lighting mode number of the "Custom" (per-key colour) effect.
+pub const CUSTOM_LIGHT_MODE: u8 = 10;
+
 /// Start the live travel test for `slots`: the keyboard then streams
 /// [`parse_travel`] packets while keys move. Stop it with [`travel_test_stop`].
 pub fn travel_test_start(slots: &[usize]) -> Packet {
@@ -833,6 +899,29 @@ mod tests {
         assert_eq!(&travel_test_stop()[..6], &[0x21, 0, 0, 0, 0x18, 0x03]);
         let push = reply(&[0x21, 0, 0, 0, 0x04, 0x01, 5, 10, 0x2C, 0x01]);
         assert_eq!(parse_travel(&push), Some((120, 300)));
+    }
+
+    #[test]
+    fn colour_layer_round_trips_through_read_format() {
+        let mut colours = vec![[0u8; 3]; KEY_SLOTS];
+        colours[22] = [0xFF, 0x00, 0x10];
+        colours[131] = [1, 2, 3];
+        let packets = colours_write(1, &colours);
+        // 396 bytes: 7 full pages of 54 plus 18, as the keyboard sends.
+        assert_eq!(packets.len(), 8);
+        assert_eq!(packets[7][4], 18);
+        assert!(packets.iter().all(|p| p[0] == 0x09 && p[1] == 0x01));
+        let replies: Vec<Packet> = packets
+            .iter()
+            .map(|p| {
+                let mut r = *p;
+                r[1] = 0x81;
+                r
+            })
+            .collect();
+        assert_eq!(parse_colours(1, &replies), Some(colours));
+        assert_eq!(parse_colours(1, &replies[..7]), None);
+        assert_eq!(parse_colours(0, &replies), None);
     }
 
     #[test]

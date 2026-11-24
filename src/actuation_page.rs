@@ -134,6 +134,7 @@ impl ActuationPage {
                         main_color: p.text_disabled,
                         unsaved: false,
                         tooltip: format!("{}: no reply from the keyboard", key.label),
+                        swatch: None,
                     };
                 };
                 let f = Fields::from(t);
@@ -154,6 +155,7 @@ impl ActuationPage {
                     main_color: if f.rapid { p.accent } else { p.text },
                     unsaved: changed.contains(&key.slot),
                     tooltip,
+                    swatch: None,
                 }
             },
         );

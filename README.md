@@ -57,6 +57,8 @@ only key lighting is shown.
 - `src/keymap.rs`: the key catalogue (English names) and this keyboard's 61-key layout
 - `src/app.rs`: the window; `src/keymap_page.rs`: the key mapping page; `src/graphite.rs`: the shared theme module
 - `PROTOCOL.md`: the reverse-engineered protocol
+- `tools/`: decoders for the vendor's web app and config files, and a window screenshot script
+- `CLAUDE.md`: project notes, rules and roadmap
 
 ## Safety
 

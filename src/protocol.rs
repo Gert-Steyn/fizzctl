@@ -23,6 +23,7 @@ pub mod cmd {
     pub const PRODUCT_INFO: u8 = 0x0D;
     pub const KEYMAP: u8 = 0x18;
     pub const CUSTOM_COLOURS: u8 = 0x09;
+    pub const SOCD: u8 = 0x24;
     pub const SERIAL: u8 = 0x15;
     pub const PROFILE_TRIGGER: u8 = 0x21;
 
@@ -747,6 +748,133 @@ pub fn colours_write(layer: u8, colours: &[[u8; 3]]) -> Vec<Packet> {
 /// The lighting mode number of the "Custom" (per-key colour) effect.
 pub const CUSTOM_LIGHT_MODE: u8 = 10;
 
+// ---------------------------------------------------------------------------
+// SOCD / snap tap (command 0x24; the vendor code calls it "PRCS")
+// ---------------------------------------------------------------------------
+
+/// Number of SOCD pair slots.
+pub const SOCD_SLOTS: usize = 20;
+const SOCD_PER_PAGE: usize = 10;
+pub const SOCD_LAST_PAGE: u16 = 1;
+
+/// How a SOCD pair resolves both keys being held.
+pub mod socd_mode {
+    /// The key pressed first is released: last input wins.
+    pub const LAST_INPUT: u8 = 0;
+    /// Key 1 always wins over key 2.
+    pub const KEY1_PRIORITY: u8 = 1;
+    /// Key 2 always wins over key 1.
+    pub const KEY2_PRIORITY: u8 = 2;
+    /// The later key doesn't fire, it only releases the first: neutral.
+    pub const NEUTRAL: u8 = 3;
+
+    pub const ALL: [u8; 4] = [LAST_INPUT, KEY1_PRIORITY, KEY2_PRIORITY, NEUTRAL];
+
+    pub fn name(mode: u8) -> &'static str {
+        match mode {
+            LAST_INPUT => "Last input wins",
+            KEY1_PRIORITY => "First key has priority",
+            KEY2_PRIORITY => "Second key has priority",
+            NEUTRAL => "Neutral (both cancel)",
+            _ => "Unknown mode",
+        }
+    }
+}
+
+/// One SOCD pair: two keys (HID usage codes) and how they resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SocdPair {
+    /// Stored as 1 for an active pair by the vendor app.
+    pub state: u8,
+    pub mode: u8,
+    pub key1: u8,
+    pub key2: u8,
+}
+
+pub fn socd_pairs_request() -> Packet {
+    let mut p = packet(cmd::SOCD);
+    p[1] = 0x01;
+    p
+}
+
+/// The 20 pair slots; `None` for an empty slot. `None` overall if a page is missing.
+pub fn parse_socd_pairs(pages: &[Packet]) -> Option<Vec<Option<SocdPair>>> {
+    let mut slots: Vec<Option<Option<SocdPair>>> = vec![None; SOCD_SLOTS];
+    for reply in pages {
+        if reply[0] != cmd::SOCD || reply[1] != 0x01 {
+            continue;
+        }
+        let first = page(reply) as usize * SOCD_PER_PAGE;
+        let body = &reply[PAYLOAD_OFFSET..PAYLOAD_OFFSET + SOCD_PER_PAGE * 4];
+        for (i, e) in body.as_chunks::<4>().0.iter().enumerate() {
+            let Some(slot) = slots.get_mut(first + i) else { continue };
+            // State 0 is empty; 07 FF FF FF is erased flash.
+            let empty = e[0] == 0 || *e == [0x07, 0xFF, 0xFF, 0xFF];
+            *slot = Some((!empty).then_some(SocdPair {
+                state: e[0],
+                mode: e[1],
+                key1: e[2],
+                key2: e[3],
+            }));
+        }
+    }
+    slots.into_iter().collect()
+}
+
+/// Packets writing all 20 slots. The keyboard acks each with `[24, 00]`.
+pub fn socd_pairs_write(slots: &[Option<SocdPair>]) -> Vec<Packet> {
+    (0..SOCD_SLOTS / SOCD_PER_PAGE)
+        .map(|n| {
+            let mut p = packet(cmd::SOCD);
+            p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+            p[4] = (SOCD_PER_PAGE * 4) as u8;
+            for i in 0..SOCD_PER_PAGE {
+                if let Some(Some(pair)) = slots.get(n * SOCD_PER_PAGE + i) {
+                    let at = PAYLOAD_OFFSET + i * 4;
+                    p[at..at + 4].copy_from_slice(&[pair.state, pair.mode, pair.key1, pair.key2]);
+                }
+            }
+            p
+        })
+        .collect()
+}
+
+/// Whether SOCD is on, plus the two codes the keyboard reports with it
+/// (on this keyboard `FA E5`, which look like an Fn + Right Shift toggle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocdPower {
+    pub on: bool,
+    pub code1: u8,
+    pub code2: u8,
+}
+
+pub fn socd_power_request() -> Packet {
+    let mut p = packet(cmd::SOCD);
+    p[1] = 0x02;
+    p
+}
+
+pub fn parse_socd_power(reply: &Packet) -> Option<SocdPower> {
+    if reply[0] != cmd::SOCD || reply[1] != 0x02 {
+        return None;
+    }
+    let p = payload(reply);
+    Some(SocdPower {
+        on: p.first() == Some(&1),
+        code1: p.get(4).copied().unwrap_or(0),
+        code2: p.get(5).copied().unwrap_or(0),
+    })
+}
+
+/// Turn SOCD on or off. No reply; read it back with [`socd_power_request`].
+pub fn socd_power_write(on: bool) -> Packet {
+    let mut p = packet(cmd::SOCD);
+    p[1] = 0x03;
+    p[4] = 0x01;
+    p[5] = on as u8;
+    p
+}
+
 /// Start the live travel test for `slots`: the keyboard then streams
 /// [`parse_travel`] packets while keys move. Stop it with [`travel_test_stop`].
 pub fn travel_test_start(slots: &[usize]) -> Packet {
@@ -922,6 +1050,44 @@ mod tests {
         assert_eq!(parse_colours(1, &replies), Some(colours));
         assert_eq!(parse_colours(1, &replies[..7]), None);
         assert_eq!(parse_colours(0, &replies), None);
+    }
+
+    #[test]
+    fn socd_replies_from_the_real_keyboard_parse() {
+        // Captured 2026-11-24: one pair A + D, last input wins; SOCD off.
+        let page0 = reply(&[0x24, 0x01, 0, 0, 0x28, 0x01, 0x00, 0x04, 0x07]);
+        let page1 = reply(&[0x24, 0x01, 0, 1, 0x28]);
+        let slots = parse_socd_pairs(&[page0, page1]).unwrap();
+        assert_eq!(slots.len(), SOCD_SLOTS);
+        assert_eq!(
+            slots[0],
+            Some(SocdPair { state: 1, mode: socd_mode::LAST_INPUT, key1: 0x04, key2: 0x07 })
+        );
+        assert!(slots[1..].iter().all(Option::is_none));
+        assert_eq!(parse_socd_pairs(&[page0]), None);
+
+        let power = reply(&[0x24, 0x02, 0, 0, 0x06, 0x00, 0, 0, 0, 0xFA, 0xE5]);
+        assert_eq!(parse_socd_power(&power), Some(SocdPower { on: false, code1: 0xFA, code2: 0xE5 }));
+    }
+
+    #[test]
+    fn socd_write_round_trips() {
+        let mut slots = vec![None; SOCD_SLOTS];
+        slots[0] = Some(SocdPair { state: 1, mode: 0, key1: 0x04, key2: 0x07 });
+        slots[13] = Some(SocdPair { state: 1, mode: 3, key1: 0x1A, key2: 0x16 });
+        let packets = socd_pairs_write(&slots);
+        assert_eq!(packets.len(), 2);
+        assert!(packets.iter().all(|p| p[0] == 0x24 && p[1] == 0x00 && p[4] == 0x28));
+        let replies: Vec<Packet> = packets
+            .iter()
+            .map(|p| {
+                let mut r = *p;
+                r[1] = 0x01;
+                r
+            })
+            .collect();
+        assert_eq!(parse_socd_pairs(&replies), Some(slots));
+        assert_eq!(&socd_power_write(true)[..6], &[0x24, 0x03, 0, 0, 0x01, 0x01]);
     }
 
     #[test]

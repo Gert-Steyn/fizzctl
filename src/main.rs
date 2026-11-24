@@ -4,6 +4,7 @@ mod actuation_page;
 mod app;
 mod keyboard_view;
 mod keymap_page;
+mod socd_page;
 mod graphite;
 mod worker;
 

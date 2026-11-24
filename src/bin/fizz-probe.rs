@@ -10,6 +10,8 @@
 //! cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1
 //! cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked
 //! cargo run --bin fizz-probe -- --travel-stop
+//! cargo run --bin fizz-probe -- --rewrite-socd
+//! cargo run --bin fizz-probe -- --survey      # read-only check of the remaining features
 //! ```
 //!
 //! `--rewrite-keymap` tests the key-map save path without changing anything:
@@ -58,6 +60,14 @@ fn main() {
     if std::env::args().any(|a| a == "--rewrite-triggers") {
         let ok = rewrite_triggers(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--rewrite-socd") {
+        let ok = rewrite_socd(&mut kb);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--survey") {
+        survey(&mut kb);
+        std::process::exit(0);
     }
     if std::env::args().any(|a| a == "--travel-stop") {
         // Safe cleanup if a travel test was interrupted before its stop.
@@ -686,6 +696,140 @@ fn apply_light(kb: &mut Keyboard, args: &[String]) -> bool {
     let after = read(kb);
     println!("Lighting after:  {after:?}");
     let ok = after == Some(want);
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Read-only survey: send the vendor app's read command for each feature we
+/// haven't built yet and show what comes back.
+fn survey(kb: &mut Keyboard) {
+    kb.on_packet = None;
+    let read = |cmd: u8, sub: u8, b4: u8, b5: u8| {
+        let mut pkt = [0u8; p::PACKET_LEN];
+        pkt[0] = cmd;
+        pkt[1] = sub;
+        pkt[4] = b4;
+        pkt[5] = b5;
+        pkt
+    };
+    // (name, packet, last page to wait for)
+    let probes: Vec<(&str, p::Packet, u16)> = vec![
+        ("SOCD entries (0x24 01)", read(0x24, 0x01, 0, 0), 1),
+        ("SOCD power (0x24 02)", read(0x24, 0x02, 0, 0), 0),
+        ("Advanced keys (0x22 80)", read(0x22, 0x80, 0, 0), 0x27),
+        ("Dead zones (0x26 00)", read(0x26, 0x00, 0, 0), 4),
+        ("Switch types list (0x25 00)", read(0x25, 0x00, 0, 0), 0),
+        ("Switch type per key (0x25 02)", read(0x25, 0x02, 0, 0), 2),
+        ("Macro slot 0 (0x19 80)", read(0x19, 0x80, 0, 0), 4),
+        ("Fn-editable keys (0x0E)", read(0x0E, 0x00, 0, 0), 0),
+    ];
+    for (name, pkt, last) in probes {
+        println!("\n{name}");
+        match kb.request_pages(name_static(name), &pkt, last, TIMEOUT, Duration::from_millis(300)) {
+            Ok(pages) => {
+                println!("  {} page(s)", pages.len());
+                for r in pages.iter().take(3) {
+                    println!("    << {}", p::hex(&r[..28]));
+                }
+                if pages.len() > 3 {
+                    println!("    … last << {}", p::hex(&pages[pages.len() - 1][..28]));
+                }
+            }
+            Err(e) => println!("  {e}"),
+        }
+    }
+    println!("\nProfile index (0x21 .. 11)");
+    let pkt = read(0x21, 0x00, 0x00, 0x11);
+    match kb.request(
+        "profile index",
+        &pkt,
+        |r| r[0] == 0x21 && r[5] == 0x11,
+        Duration::from_millis(1000),
+    ) {
+        Ok(r) => println!("    << {}", p::hex(&r[..16])),
+        Err(e) => println!("  {e}"),
+    }
+    println!("\nStatus lock and mode bytes");
+    if let Ok(r) = kb.request_same("status", &p::status_request(), TIMEOUT) {
+        let sup = &r[5..0x17];
+        println!(
+            "  lock keys supported {}, lock byte {:#04x}, SOCD flag {}, 6-key flag byte {:#04x}, unknown flags byte {:#04x}",
+            sup[0] == 1,
+            sup[15],
+            sup[9] == 1,
+            sup[17],
+            sup[15]
+        );
+    }
+}
+
+fn name_static(_: &str) -> &'static str {
+    "survey read"
+}
+
+/// Write the SOCD pairs and on/off state back unchanged and verify.
+fn rewrite_socd(kb: &mut Keyboard) -> bool {
+    kb.on_packet = None;
+    let (pairs, power) = match (kb.read_socd_pairs(), kb.read_socd_power()) {
+        (Ok(Some(pairs)), Ok(Some(power))) => (pairs, power),
+        _ => {
+            println!("\nCouldn't read SOCD, stopping without writing anything");
+            return false;
+        }
+    };
+    let used: Vec<_> = pairs.iter().flatten().collect();
+    println!("\nSOCD is {}, {} pair(s): {used:?}", if power.on { "on" } else { "off" }, used.len());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = format!("backups/socd-{stamp}.txt");
+    let mut text = format!(
+        "# Fizz SOCD backup: power {} (codes {:02X} {:02X}); slot state mode key1 key2\n",
+        power.on as u8, power.code1, power.code2
+    );
+    for (i, p) in pairs.iter().enumerate() {
+        if let Some(p) = p {
+            text.push_str(&format!("{i} {:02X} {:02X} {:02X} {:02X}\n", p.state, p.mode, p.key1, p.key2));
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all("backups").and_then(|_| std::fs::write(&path, text)) {
+        println!("  couldn't write the backup ({e}), stopping without writing anything");
+        return false;
+    }
+    println!("  backup saved to {path}");
+
+    println!("\nWriting the pairs back unchanged");
+    let pairs_ok = match kb.write_socd_pairs(&pairs) {
+        Ok(Some(after)) => {
+            println!("  read-back matches {}", after == pairs);
+            after == pairs
+        }
+        Ok(None) => {
+            println!("  read-back incomplete");
+            false
+        }
+        Err(e) => {
+            println!("  write failed: {e}");
+            false
+        }
+    };
+    let power_after = kb.read_socd_power().ok().flatten();
+    println!("  SOCD on/off after writing pairs: {power_after:?}");
+    let power_kept = power_after == Some(power);
+
+    println!("\nWriting on/off back unchanged ({})", if power.on { "on" } else { "off" });
+    let power_ok = match kb.set_socd_power(power.on) {
+        Ok(after) => {
+            println!("  read back {after:?}");
+            after == Some(power)
+        }
+        Err(e) => {
+            println!("  write failed: {e}");
+            false
+        }
+    };
+    let ok = pairs_ok && power_kept && power_ok;
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
 }

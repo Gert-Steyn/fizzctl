@@ -15,6 +15,11 @@ moves. `PROTOCOL.md` is the full protocol reference; this file holds context, ru
 - Supports: per-key RGB, polling rate (currently 8000 Hz), key calibration (calibrated). Its status
   does **not** set the RS/RKRT/DKS/dead-band/music flags, but actuation and rapid trigger via
   `0x21 / 0x18` **do** work (those flags are other features).
+- **Feature survey (read-only, 2026-11-24, `fizz-probe --survey`):** SOCD supported (status
+  "PRCS" flag = SOCD; one pair A+D last-input, off, toggle reported as Fn+Right Shift); macros
+  supported (slot 0 empty, reads as `FF` erased flash); advanced keys answer with 40 empty slots
+  and dead zones answer all-zero, but their status flags are off, so unproven; one switch type
+  only (nothing to configure); profiles: **no reply** (unsupported); Win/Alt locks: flag off.
 - Actuation range 0.10–3.40 mm in 0.01 mm steps (config reply `54 01 01 01 0A`). Stock setting on
   all 61 keys: actuation 1.70 mm, rapid trigger on (mode `0x0C`), sensitivity 0.51 mm.
 - **No side light strip**: the side-light mode list (`0x02`) is empty. Only key lighting is shown.
@@ -33,6 +38,8 @@ cargo run --bin fizz-probe -- --rewrite-triggers # same for every key's actuatio
 cargo run --bin fizz-probe -- --rewrite-poll-rate # writes the current polling rate back, verifies
 cargo run --bin fizz-probe -- --rewrite-colours [--layer 0|1]  # NOT a no-op: activates the layer and the Custom effect
 cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1   # set lighting: mode bri spd fg bg dir rainbow
+cargo run --bin fizz-probe -- --rewrite-socd     # SOCD pairs + on/off back unchanged, verifies
+cargo run --bin fizz-probe -- --survey           # read-only check of features not built yet
 cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked  # live travel test on one key; only for agreed experiments
 cargo test                                   # unit tests (protocol + keymap)
 cargo clippy --all-targets                   # 1 expected warning, in src/graphite.rs (see below)
@@ -57,11 +64,13 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `src/app.rs` | Window shell (sidebar, toolbar), Overview, Lighting, Packet log, Settings pages. |
 | `src/keymap_page.rs` | Key mapping page: layer switch, picker, save. |
 | `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
+| `src/socd_page.rs` | Snap tap (SOCD) page: on/off (immediate), key pairs with modes, save. |
 | `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
 | `src/graphite.rs` | Copy of the Graphite egui theme module plus local additions (see Design). |
 | `src/bin/fizz-probe.rs` | CLI diagnostics and the key-map write-back test. |
 | `tools/decode_app.py` | Decrypt + de-obfuscate the vendor `app.js` statically. |
 | `tools/decode_config.py` | Decode vendor `config/*.json` (`WMX1:` format). |
+| `tools/decode_i18n.py` | Extract the app's built-in (Chinese) UI strings (`witmod-i18n-0x7f`). |
 | `tools/screenshot.ps1` | Capture a window to PNG. |
 | `backups/` | Key-map backups from `--rewrite-keymap` (git-ignored). |
 
@@ -141,6 +150,11 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   `t t p r` high bytes at `[28..36]`. One packet sets any number of keys; no ack, so read back.
   Modes: `0` fixed, `0x0C` RT single sensitivity (release = press), `0x0D` RT split, `0x01` legacy RT.
   **No-op write verified 2026-11-24** (1 packet for all 61 keys, read-back identical).
+- SOCD `0x24`: pairs read `[1]=1` (2 pages × 10 slots of `state mode key1 key2`; state 0 or
+  `07 FF FF FF` = empty), write `[1]=0` same layout (acked `[24 00]`); on/off read `[1]=2` →
+  payload `[0]` on, `[4] [5]` = toggle keys (`FA E5`); set `[1]=3 [4]=1 [5]=on`. Modes: 0 last
+  input wins, 1 key 1 priority (vendor default), 2 key 2 priority, 3 neutral. No-op write of pairs
+  and on/off verified 2026-11-24; writing pairs does **not** turn SOCD on, and touched nothing else.
 - Polling rate write `0x21 [5]=9 [6]=1 [7]=1|2|4|8` (no reply; read back). No-op write verified
   2026-11-24 (8000 → 8000).
 - **Live travel test incident (2026-11-24):** `0x21 [4]=0x18 [5]=2` + all 61 keys in the bitmap
@@ -185,6 +199,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
 | Polling rate (1/2/4/8 kHz on Overview, applies immediately) | Done. No-op write verified; a real change via the GUI not yet tried |
 | Per-key colours (Custom effect: paint keys on the Lighting page) | Done. Read verified; colour write verified (acks + read-back); lighting write verified via probe. Painting from the GUI not yet tried |
+| Snap tap (SOCD): on/off, up to 20 pairs with 4 modes | Done. Read verified; no-op writes verified; a real change via the GUI not yet tried |
 | Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
@@ -209,13 +224,14 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 2. ~~Polling rate setting~~ done 2026-11-24.
 3. ~~Per-key RGB~~ done 2026-11-24 (edits the active colour layer only). Possible follow-ups:
    switch between the two colour layers (writing a layer activates it), drag-to-paint, presets.
-4. **Macros.** `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
+4. ~~SOCD~~ done 2026-11-24 (not originally on the list; found by the survey).
+5. **Macros.** `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
    delete `[1]=3 [4]=index`. Step = `{keyCode, type|state<<4, delayHi, delayLo}`. Key-map kind `0x10`
    with `arg1` = macro index. Needs a recorder UI.
-5. Smaller: restore a `backups/` file onto the keyboard; profiles (`0x21 [5]=0x11` read,
-   `[5]=0x12 [6]=n` set) if the board has them; Win-key / Alt+Tab locks (`0x14 [1]=0 [4]=1`, flags at
-   bytes 0x0C–0x12; read via status support bytes); sleep timer only if a safe read is found.
-6. Release: app icon, single `.exe`, GitHub Actions building Windows + Linux binaries; run on Linux once.
+6. Then: calibration (ask first); dead zones and advanced keys only after a test proves the
+   firmware uses them; export/import of all settings; restore a `backups/` file. Skip: profiles (no
+   reply), locks (flag off), switch types (one type), sleep timer (blocked command).
+7. Release (after the features, per Gert): app icon, single `.exe`, GitHub Actions building Windows + Linux binaries; run on Linux once.
 
 ## Ideas / open questions
 - What do light-config `power` and `timer` bytes mean? Passed through unchanged for now.

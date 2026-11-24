@@ -11,6 +11,7 @@ use crate::graphite::{self, Tone, Type, size, space};
 use crate::actuation_page::ActuationPage;
 use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::keymap_page::{KeymapPage, Outcome};
+use crate::socd_page::SocdPage;
 use crate::worker::{LogEntry, Request, Snapshot, Update, Worker};
 
 const THEME_KEY: &str = "theme";
@@ -39,6 +40,7 @@ enum Page {
     Overview,
     Keymap,
     Actuation,
+    Socd,
     Lighting,
     Packets,
     Settings,
@@ -50,6 +52,7 @@ impl Page {
             Page::Overview => "Overview",
             Page::Keymap => "Key mapping",
             Page::Actuation => "Actuation",
+            Page::Socd => "Snap tap",
             Page::Lighting => "Lighting",
             Page::Packets => "Packet log",
             Page::Settings => "Settings",
@@ -61,6 +64,7 @@ impl Page {
             Page::Overview => Icon::Info,
             Page::Keymap => Icon::Keyboard,
             Page::Actuation => Icon::Gauge,
+            Page::Socd => Icon::ArrowLeftRight,
             Page::Lighting => Icon::Lightbulb,
             Page::Packets => Icon::Terminal,
             Page::Settings => Icon::Settings,
@@ -84,6 +88,7 @@ pub struct FizzApp {
     light_edit: Option<LightConfig>,
     keymap: KeymapPage,
     actuation: ActuationPage,
+    socd: SocdPage,
     applying: bool,
     /// Per-key colours being edited (Custom effect); `None` until read.
     colour_edit: Option<Vec<[u8; 3]>>,
@@ -115,6 +120,7 @@ impl FizzApp {
         let page = match env("FIZZ_PAGE").as_str() {
             "keys" => Page::Keymap,
             "actuation" => Page::Actuation,
+            "socd" => Page::Socd,
             "lighting" => Page::Lighting,
             "packets" => Page::Packets,
             "settings" => Page::Settings,
@@ -139,6 +145,7 @@ impl FizzApp {
             light_edit: None,
             keymap,
             actuation,
+            socd: SocdPage::default(),
             applying: false,
             colour_edit: None,
             brush: [0xFF, 0xFF, 0xFF],
@@ -166,6 +173,7 @@ impl FizzApp {
                     self.saving_colours = false;
                     self.keymap.reset();
                     self.actuation.reset();
+                    self.socd.reset();
                 }
                 Update::Snapshot(snapshot) => {
                     let device_light = self.snapshot.as_ref().and_then(|s| s.light);
@@ -185,6 +193,7 @@ impl FizzApp {
                     }
                     self.keymap.on_snapshot(&snapshot);
                     self.actuation.on_snapshot(&snapshot);
+                    self.socd.on_snapshot(&snapshot);
                     self.snapshot = Some(*snapshot);
                 }
                 Update::LightApplied(stored) => {
@@ -227,6 +236,27 @@ impl FizzApp {
                         self.notify(Notice::Success("Key colours saved to the keyboard.".into()));
                     }
                 }
+                Update::SocdPairsSaved(stored) => {
+                    if let Some(s) = self.snapshot.as_mut() {
+                        s.socd_pairs = Some(stored.clone());
+                    }
+                    self.socd.on_pairs_saved(stored);
+                    self.notify(Notice::Success("SOCD pairs saved to the keyboard.".into()));
+                }
+                Update::SocdPowerSet(power) => {
+                    if let Some(s) = self.snapshot.as_mut()
+                        && power.is_some()
+                    {
+                        s.socd_power = power;
+                    }
+                    self.socd.on_power_set(power);
+                    if let Some(power) = power {
+                        self.notify(Notice::Success(format!(
+                            "SOCD turned {}.",
+                            if power.on { "on" } else { "off" }
+                        )));
+                    }
+                }
                 Update::PollRateSet(stored) => {
                     if let Some(s) = self.snapshot.as_mut() {
                         s.poll_rate_hz = stored;
@@ -244,6 +274,7 @@ impl FizzApp {
                     self.applying = false;
                     self.keymap.on_error();
                     self.actuation.on_error();
+                    self.socd.on_error();
                     self.notify(Notice::Error(message));
                 }
                 Update::Packet(entry) => {
@@ -275,7 +306,14 @@ impl FizzApp {
             ui.label(graphite::text("Fizz control", Type::Heading));
         });
         ui.add_space(space::S4);
-        for page in [Page::Overview, Page::Keymap, Page::Actuation, Page::Lighting, Page::Packets] {
+        for page in [
+            Page::Overview,
+            Page::Keymap,
+            Page::Actuation,
+            Page::Socd,
+            Page::Lighting,
+            Page::Packets,
+        ] {
             if graphite::nav_row(ui, Some(page.icon()), page.title(), self.page == page).clicked()
             {
                 self.page = page;
@@ -815,6 +853,11 @@ impl eframe::App for FizzApp {
                     page => {
                         ScrollArea::vertical().id_salt(page.title()).show(ui, |ui| match page {
                             Page::Overview => self.overview(ui),
+                            Page::Socd => {
+                                if self.connected_or_placeholder(ui).is_some() {
+                                    self.socd.show(ui, &self.worker.tx);
+                                }
+                            }
                             Page::Lighting => self.lighting(ui),
                             _ => self.settings(ui),
                         });

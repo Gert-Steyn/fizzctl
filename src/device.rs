@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 
-use crate::protocol::{self, KeyAction, KeyTrigger, Layer, PACKET_LEN, Packet, TriggerConfig};
+use crate::protocol::{
+    self, KeyAction, KeyTrigger, Layer, PACKET_LEN, Packet, SocdPair, SocdPower, TriggerConfig,
+};
 
 pub const VENDOR_ID: u16 = 0x2E3C;
 /// `C365` is the normal mode; `C366`/`C367` are the gamepad modes and `C368`
@@ -399,6 +401,58 @@ impl Keyboard {
             verified: stored.as_deref() == Some(colours),
             stored,
         })
+    }
+
+    /// All 20 SOCD pair slots. `None` when a page was missing.
+    pub fn read_socd_pairs(&mut self) -> Result<Option<Vec<Option<SocdPair>>>> {
+        let pages = self.request_pages(
+            "SOCD pairs",
+            &protocol::socd_pairs_request(),
+            protocol::SOCD_LAST_PAGE,
+            REPLY_TIMEOUT,
+            PAGE_IDLE,
+        )?;
+        Ok(protocol::parse_socd_pairs(&pages))
+    }
+
+    pub fn read_socd_power(&mut self) -> Result<Option<SocdPower>> {
+        let reply = self.request(
+            "SOCD power",
+            &protocol::socd_power_request(),
+            |r| r[0] == protocol::cmd::SOCD && r[1] == 0x02,
+            REPLY_TIMEOUT,
+        )?;
+        Ok(protocol::parse_socd_power(&reply))
+    }
+
+    /// Write all SOCD slots (each page acknowledged), then read them back.
+    /// `Ok(None)` if the read-back was incomplete.
+    pub fn write_socd_pairs(
+        &mut self,
+        slots: &[Option<SocdPair>],
+    ) -> Result<Option<Vec<Option<SocdPair>>>> {
+        if slots.len() != protocol::SOCD_SLOTS {
+            return Err(Error::Incomplete);
+        }
+        for packet in protocol::socd_pairs_write(slots) {
+            match self.request(
+                "SOCD page",
+                &packet,
+                |r| r[0] == protocol::cmd::SOCD && r[1] == 0x00,
+                ACK_TIMEOUT,
+            ) {
+                Ok(_) | Err(Error::Timeout(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.read_socd_pairs()
+    }
+
+    /// Turn SOCD on or off and read the state back.
+    pub fn set_socd_power(&mut self, on: bool) -> Result<Option<SocdPower>> {
+        self.write_only(&protocol::socd_power_write(on))?;
+        std::thread::sleep(Duration::from_millis(50));
+        self.read_socd_power()
     }
 
     /// Actuation range and step size.

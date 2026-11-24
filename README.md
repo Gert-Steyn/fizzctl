@@ -25,6 +25,7 @@ map, actuation, polling rate). The first two also save a backup to `backups/`:
 cargo run --bin fizz-probe -- --rewrite-keymap
 cargo run --bin fizz-probe -- --rewrite-triggers
 cargo run --bin fizz-probe -- --rewrite-poll-rate
+cargo run --bin fizz-probe -- --rewrite-socd
 ```
 
 ## What works
@@ -38,6 +39,7 @@ cargo run --bin fizz-probe -- --rewrite-poll-rate
 | Per-key colours (Custom effect): paint keys on the keyboard drawing | Read and write |
 | Key mapping, default and Fn layers: keys, media, mouse, shortcuts, lighting controls | Read and write |
 | Actuation point and rapid trigger, per key or many keys at once | Read and write |
+| Snap tap (SOCD): on/off and up to 20 key pairs with 4 modes | Read and write |
 | Packet log of all traffic | Yes |
 | Macros, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
 | Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
@@ -94,7 +96,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Developer overrides
 
-`FIZZ_PAGE` (`keys`, `actuation`, `lighting`, `packets`, `settings`) picks the start page,
+`FIZZ_PAGE` (`keys`, `actuation`, `socd`, `lighting`, `packets`, `settings`) picks the start page,
 `FIZZ_THEME` (`dark`, `light`) forces a theme without saving it, and on the
 key mapping and actuation pages `FIZZ_KEY` (a slot number, e.g. `66` for Caps)
 preselects a key and `FIZZ_LAYER=fn` opens the Fn layer. All are for screenshots.

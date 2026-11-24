@@ -190,6 +190,32 @@ After writing key maps, poll `0x01` until the "storing" bit (`s[17]` bit 1, i.e.
 * The keyboard's mode list (`0x0A`) leaves out Custom (10); the vendor app adds it when the status
   per-key-RGB flag is set.
 
+## SOCD / snap tap (`0x24`), confirmed on the real keyboard
+
+The vendor code calls this "PRCS"; its status flag (support byte 9) means SOCD support.
+
+* **Pairs**: read `24 01` → pages 0–1, payload 40 bytes = 10 slots × `[state, mode, key1, key2]`
+  (keys are HID usage codes). State 0, or `07 FF FF FF` (erased), is an empty slot; 20 slots total.
+  Write `24 00 page 28` + the same 40 bytes per page; each page is acked `[24 00]`.
+* **On/off**: read `24 02` → payload `[0]` = on, `[4] [5]` = two key codes (`FA E5` here, which
+  looks like the Fn + Right Shift toggle). Set `24 03 .. .. 01 on`, no reply.
+* **Modes** (from the app's Chinese UI strings): 0 the key pressed first is interrupted (last input
+  wins), 1 key 1 interrupts key 2 (key 1 priority, the vendor default), 2 key 2 priority,
+  3 the later key only interrupts the first (neutral).
+* Stock: one pair A (04) + D (07), mode 0, SOCD off. Writing the pairs and the off state back
+  unchanged was verified, and writing pairs did not change the on/off state.
+
+## Other features (read-only survey, 2026-11-24)
+
+| Command | Reply on this keyboard |
+|---|---|
+| `22 80` advanced keys | 40 pages, all empty |
+| `26 00` dead zones | 5 pages, all zero (status flag says unsupported) |
+| `25 00` switch list | count 1, type 01; `25 02` per key: all 01 |
+| `19 80` macro slot 0 | 5 pages of `FF` (empty) |
+| `0E` Fn-editable keys | a 22-byte column bitmap |
+| `21 .. 11` profile index | no reply |
+
 ## Polling rate
 
 * Read `0x21 [4]=1 [5]=9` → reply `[6]` = 1/2/4/8 (1–8 kHz). Write `0x21 [5]=9 [6]=1 [7]=code`, no reply.

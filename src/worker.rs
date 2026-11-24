@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use fizz::device::{Dir, Ident, Keyboard};
 use fizz::protocol::{
-    self as p, KeyAction, KeyTrigger, Layer, LightConfig, ModeList, Packet, ProductInfo, Status,
-    TriggerConfig, Zone,
+    self as p, KeyAction, KeyTrigger, Layer, LightConfig, ModeList, Packet, ProductInfo, SocdPair,
+    SocdPower, Status, TriggerConfig, Zone,
 };
 
 const TIMEOUT: Duration = Duration::from_millis(400);
@@ -27,6 +27,9 @@ pub enum Request {
     SetPollRate(u32),
     /// Per-key colours for colour layer 0 or 1.
     SaveColours(u8, Vec<[u8; 3]>),
+    /// All 20 SOCD slots.
+    SaveSocdPairs(Vec<Option<SocdPair>>),
+    SetSocdPower(bool),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +48,8 @@ pub struct Snapshot {
     /// The colour layer the Custom effect shows, and its per-slot colours.
     pub colour_layer: Option<u8>,
     pub colours: Option<Vec<[u8; 3]>>,
+    pub socd_pairs: Option<Vec<Option<SocdPair>>>,
+    pub socd_power: Option<SocdPower>,
 }
 
 pub struct LogEntry {
@@ -63,6 +68,8 @@ pub enum Update {
     /// The polling rate read back after setting it.
     PollRateSet(Option<u32>),
     ColoursSaved(u8, Vec<[u8; 3]>),
+    SocdPairsSaved(Vec<Option<SocdPair>>),
+    SocdPowerSet(Option<SocdPower>),
     Error(String),
     Packet(LogEntry),
 }
@@ -121,7 +128,9 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
                     | Request::SaveKeymap(..)
                     | Request::SaveTriggers(_)
                     | Request::SetPollRate(_)
-                    | Request::SaveColours(..),
+                    | Request::SaveColours(..)
+                    | Request::SaveSocdPairs(_)
+                    | Request::SetSocdPower(_),
                 ) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
@@ -157,6 +166,8 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
             Ok(Request::SaveTriggers(groups)) => save_triggers(keyboard, &groups, &link),
             Ok(Request::SetPollRate(hz)) => set_poll_rate(keyboard, hz, &link),
             Ok(Request::SaveColours(layer, colours)) => save_colours(keyboard, layer, &colours, &link),
+            Ok(Request::SaveSocdPairs(pairs)) => save_socd_pairs(keyboard, &pairs, &link),
+            Ok(Request::SetSocdPower(on)) => set_socd_power(keyboard, on, &link),
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -311,6 +322,48 @@ fn save_colours(
     Ok(())
 }
 
+fn save_socd_pairs(
+    kb: &mut Keyboard,
+    pairs: &[Option<SocdPair>],
+    link: &Link,
+) -> fizz::device::Result<()> {
+    match kb.write_socd_pairs(pairs) {
+        Ok(Some(stored)) => {
+            let verified = stored == pairs;
+            link.send(Update::SocdPairsSaved(stored));
+            if !verified {
+                link.send(Update::Error(
+                    "The keyboard saved different SOCD pairs than were sent. The page now shows what it stored."
+                        .into(),
+                ));
+            }
+        }
+        Ok(None) => {
+            link.send(Update::Error(
+                "Couldn't read the SOCD pairs back after saving. Read the keyboard again to check them."
+                    .into(),
+            ));
+        }
+        Err(fizz::device::Error::Incomplete) => {
+            link.send(Update::Error("The SOCD list is incomplete, so it wasn't saved.".into()));
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+fn set_socd_power(kb: &mut Keyboard, on: bool, link: &Link) -> fizz::device::Result<()> {
+    let stored = kb.set_socd_power(on)?;
+    link.send(Update::SocdPowerSet(stored));
+    if stored.map(|p| p.on) != Some(on) {
+        link.send(Update::Error(format!(
+            "The keyboard didn't turn SOCD {}.",
+            if on { "on" } else { "off" }
+        )));
+    }
+    Ok(())
+}
+
 fn read_triggers(kb: &mut Keyboard) -> Option<Vec<Option<KeyTrigger>>> {
     let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
     let read = kb.read_key_triggers(&slots).ok()?;
@@ -352,6 +405,8 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
     let triggers = read_triggers(kb);
     let colour_layer = kb.read_colour_layer().ok().flatten();
     let colours = colour_layer.and_then(|layer| kb.read_colours(layer).ok().flatten());
+    let socd_pairs = kb.read_socd_pairs().ok().flatten();
+    let socd_power = kb.read_socd_power().ok().flatten();
     Snapshot {
         status,
         product,
@@ -365,5 +420,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         triggers,
         colour_layer,
         colours,
+        socd_pairs,
+        socd_power,
     }
 }

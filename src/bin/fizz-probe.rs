@@ -11,6 +11,10 @@
 //! cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked
 //! cargo run --bin fizz-probe -- --travel-stop
 //! cargo run --bin fizz-probe -- --rewrite-socd
+//! cargo run --bin fizz-probe -- --read-macros
+//! cargo run --bin fizz-probe -- --macro-write-test
+//! cargo run --bin fizz-probe -- --dump-macro <slot>
+//! cargo run --bin fizz-probe -- --clear-macro <slot>
 //! cargo run --bin fizz-probe -- --survey      # read-only check of the remaining features
 //! ```
 //!
@@ -63,6 +67,67 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--rewrite-socd") {
         let ok = rewrite_socd(&mut kb);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--dump-macro") {
+        // Read-only: print a macro slot's raw bytes.
+        kb.on_packet = None;
+        let slot: usize = std::env::args().nth(pos + 1).and_then(|a| a.parse().ok()).unwrap_or(0);
+        match kb.read_macro_raw(slot) {
+            Ok(Some(raw)) => {
+                for (i, row) in raw.chunks(32).enumerate() {
+                    println!("  {:3}: {}", i * 32, p::hex(row));
+                }
+                println!("  parses as {:?}", p::parse_macro(&raw));
+            }
+            other => println!("  {other:?}"),
+        }
+        std::process::exit(0);
+    }
+    if std::env::args().any(|a| a == "--macro-write-all-test") {
+        let ok = macro_write_all_test(&mut kb);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--delete-macro") {
+        // The vendor app's delete command: 19 03 .. .. <index>.
+        kb.on_packet = None;
+        let slot: usize = std::env::args().nth(pos + 1).and_then(|a| a.parse().ok()).unwrap_or(usize::MAX);
+        if slot >= p::MACRO_SLOTS {
+            println!("usage: --delete-macro <slot 0-9>");
+            std::process::exit(2);
+        }
+        let ok = kb.write_only(&p::macro_delete(slot)).is_ok();
+        std::thread::sleep(Duration::from_millis(100));
+        let after = kb.read_macro_raw(slot);
+        match &after {
+            Ok(Some(raw)) => println!(
+                "delete sent {ok}; slot {slot} now starts {} (all FF: {})",
+                p::hex(&raw[..16]),
+                raw.iter().all(|b| *b == 0xFF)
+            ),
+            other => println!("delete sent {ok}; read back {other:?}"),
+        }
+        std::process::exit(0);
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--clear-macro") {
+        // Write an empty (all-zero) slot, as the vendor app does for unused slots.
+        kb.on_packet = None;
+        let slot: usize = std::env::args().nth(pos + 1).and_then(|a| a.parse().ok()).unwrap_or(usize::MAX);
+        if slot >= p::MACRO_SLOTS {
+            println!("usage: --clear-macro <slot 0-9>");
+            std::process::exit(2);
+        }
+        let empty = p::macro_bytes(slot, None);
+        let ok = matches!(kb.write_macro_raw(slot, &empty), Ok(Some(back)) if back == empty);
+        println!("slot {slot} cleared: {ok}");
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--read-macros") {
+        read_macros(&mut kb);
+        std::process::exit(0);
+    }
+    if std::env::args().any(|a| a == "--macro-write-test") {
+        let ok = macro_write_test(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
     }
     if std::env::args().any(|a| a == "--survey") {
@@ -830,6 +895,199 @@ fn rewrite_socd(kb: &mut Keyboard) -> bool {
         }
     };
     let ok = pairs_ok && power_kept && power_ok;
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Read-only: list what's in each macro slot and which keys use macros.
+fn read_macros(kb: &mut Keyboard) {
+    kb.on_packet = None;
+    println!("\nMacro slots");
+    for slot in 0..p::MACRO_SLOTS {
+        match kb.read_macro_raw(slot) {
+            Ok(Some(raw)) => match p::parse_macro(&raw) {
+                Some(m) => println!(
+                    "  slot {slot}: {} ({}x), {} steps: {:?}",
+                    p::macro_play::name(m.play),
+                    m.count,
+                    m.steps.len(),
+                    &m.steps[..m.steps.len().min(4)]
+                ),
+                None => println!("  slot {slot}: empty (header {})", p::hex(&raw[..8])),
+            },
+            Ok(None) => println!("  slot {slot}: no page 0"),
+            Err(e) => println!("  slot {slot}: {e}"),
+        }
+    }
+    for layer in [p::Layer::Default, p::Layer::Fn] {
+        if let Ok(Some(keys)) = kb.read_keymap(layer) {
+            let bound: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.kind == fizz::keymap::kind::MACRO)
+                .map(|(slot, k)| (slot, k.arg1))
+                .collect();
+            println!("  {layer:?} layer keys bound to macros (key slot, macro slot): {bound:?}");
+        }
+    }
+}
+
+/// Write a small test macro into an empty slot that no key uses, verify it,
+/// then put the slot's original bytes back and verify that too.
+fn macro_write_test(kb: &mut Keyboard) -> bool {
+    kb.on_packet = None;
+    let mut bound = Vec::new();
+    for layer in [p::Layer::Default, p::Layer::Fn] {
+        match kb.read_keymap(layer) {
+            Ok(Some(keys)) => bound.extend(
+                keys.iter()
+                    .filter(|k| k.kind == fizz::keymap::kind::MACRO)
+                    .map(|k| k.arg1 as usize),
+            ),
+            _ => {
+                println!("\nCouldn't read the key map, stopping without writing anything");
+                return false;
+            }
+        }
+    }
+    let mut chosen = None;
+    for slot in (0..p::MACRO_SLOTS).rev() {
+        if bound.contains(&slot) {
+            continue;
+        }
+        if let Ok(Some(raw)) = kb.read_macro_raw(slot)
+            && p::parse_macro(&raw).is_none()
+        {
+            chosen = Some((slot, raw));
+            break;
+        }
+    }
+    let Some((slot, original)) = chosen else {
+        println!("\nNo empty, unused macro slot; stopping without writing anything");
+        return false;
+    };
+    println!("\nUsing empty slot {slot} (no key uses it); original header {}", p::hex(&original[..8]));
+
+    let test = p::Macro {
+        play: p::macro_play::TIMES,
+        count: 2,
+        steps: vec![
+            p::MacroStep { press: true, mouse: false, code: 0x04, delay_ms: 30 },
+            p::MacroStep { press: false, mouse: false, code: 0x04, delay_ms: 30 },
+        ],
+    };
+    let raw = p::macro_bytes(slot, Some(&test));
+    let wrote = match kb.write_macro_raw(slot, &raw) {
+        Ok(Some(back)) => {
+            let same = back == raw;
+            println!("  test macro written, read-back matches {same}, parses as {:?}", p::parse_macro(&back));
+            same
+        }
+        Ok(None) => {
+            println!("  test macro read-back incomplete");
+            false
+        }
+        Err(e) => {
+            println!("  write failed: {e}");
+            false
+        }
+    };
+
+    // Erased flash (all FF) can't be written back: the keyboard ignores a
+    // page with an FF header. Clear it the vendor app's way, with zeros.
+    let restore = if original.iter().all(|b| *b == 0xFF) {
+        p::macro_bytes(slot, None)
+    } else {
+        original
+    };
+    println!("\nClearing the slot again (empty, as the vendor app writes it)");
+    let restored = match kb.write_macro_raw(slot, &restore) {
+        Ok(Some(back)) => {
+            let same = back == restore && p::parse_macro(&back).is_none();
+            println!("  read-back is empty {same}");
+            same
+        }
+        Ok(None) => {
+            println!("  read-back incomplete");
+            false
+        }
+        Err(e) => {
+            println!("  restore failed: {e}");
+            false
+        }
+    };
+    let light = kb
+        .request_same("light config", &p::light_config_request(p::Zone::Keys), TIMEOUT)
+        .ok()
+        .and_then(|r| p::parse_light_config(p::Zone::Keys, &r));
+    println!("  lighting afterwards: {light:?}");
+    let ok = wrote && restored;
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Write all 10 slots in order, like the vendor app (test macro in slot 9,
+/// the rest empty), check, then write all 10 empty and check again. Only
+/// runs when every slot is empty and no key uses a macro.
+fn macro_write_all_test(kb: &mut Keyboard) -> bool {
+    kb.on_packet = None;
+    for layer in [p::Layer::Default, p::Layer::Fn] {
+        match kb.read_keymap(layer) {
+            Ok(Some(keys)) if keys.iter().all(|k| k.kind != fizz::keymap::kind::MACRO) => {}
+            _ => {
+                println!("\nA key uses a macro (or the key map didn't read); stopping");
+                return false;
+            }
+        }
+    }
+    for slot in 0..p::MACRO_SLOTS {
+        match kb.read_macro_raw(slot) {
+            Ok(Some(raw)) if p::parse_macro(&raw).is_none() => {}
+            _ => {
+                println!("\nSlot {slot} isn't empty (or didn't read); stopping");
+                return false;
+            }
+        }
+    }
+    let test = p::Macro {
+        play: p::macro_play::TIMES,
+        count: 2,
+        steps: vec![
+            p::MacroStep { press: true, mouse: false, code: 0x04, delay_ms: 30 },
+            p::MacroStep { press: false, mouse: false, code: 0x04, delay_ms: 30 },
+        ],
+    };
+    let write_all = |kb: &mut Keyboard, with_test: bool| -> Option<Vec<[u8; p::MACRO_BYTES]>> {
+        let wanted: Vec<_> = (0..p::MACRO_SLOTS)
+            .map(|slot| p::macro_bytes(slot, (with_test && slot == 9).then_some(&test)))
+            .collect();
+        for (slot, raw) in wanted.iter().enumerate() {
+            if let Err(e) = kb.write_macro_raw(slot, raw) {
+                println!("  slot {slot} write failed: {e}");
+                return None;
+            }
+        }
+        // Read everything again after the last write.
+        let mut back = Vec::new();
+        for slot in 0..p::MACRO_SLOTS {
+            back.push(kb.read_macro_raw(slot).ok().flatten()?);
+        }
+        let ok = back == wanted;
+        println!("  all 10 slots read back as written: {ok}");
+        if !ok {
+            for (slot, (b, w)) in back.iter().zip(&wanted).enumerate() {
+                if b != w {
+                    println!("    slot {slot}: got {} want {}", p::hex(&b[..12]), p::hex(&w[..12]));
+                }
+            }
+        }
+        ok.then_some(back)
+    };
+    println!("\nWriting all 10 slots: test macro in slot 9, the rest empty");
+    let first = write_all(kb, true).is_some();
+    println!("\nWriting all 10 slots empty again");
+    let second = write_all(kb, false).is_some();
+    let ok = first && second;
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
 }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use fizz::device::{Dir, Ident, Keyboard};
 use fizz::protocol::{
-    self as p, KeyAction, KeyTrigger, Layer, LightConfig, ModeList, Packet, ProductInfo, SocdPair,
+    self as p, KeyAction, KeyTrigger, Layer, LightConfig, Macro, ModeList, Packet, ProductInfo, SocdPair,
     SocdPower, Status, TriggerConfig, Zone,
 };
 
@@ -30,6 +30,8 @@ pub enum Request {
     /// All 20 SOCD slots.
     SaveSocdPairs(Vec<Option<SocdPair>>),
     SetSocdPower(bool),
+    /// All 10 macro slots (they can only be saved together).
+    SaveMacros(Vec<Option<Macro>>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,6 +52,7 @@ pub struct Snapshot {
     pub colours: Option<Vec<[u8; 3]>>,
     pub socd_pairs: Option<Vec<Option<SocdPair>>>,
     pub socd_power: Option<SocdPower>,
+    pub macros: Option<Vec<Option<Macro>>>,
 }
 
 pub struct LogEntry {
@@ -70,6 +73,7 @@ pub enum Update {
     ColoursSaved(u8, Vec<[u8; 3]>),
     SocdPairsSaved(Vec<Option<SocdPair>>),
     SocdPowerSet(Option<SocdPower>),
+    MacrosSaved(Vec<Option<Macro>>),
     Error(String),
     Packet(LogEntry),
 }
@@ -130,7 +134,8 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
                     | Request::SetPollRate(_)
                     | Request::SaveColours(..)
                     | Request::SaveSocdPairs(_)
-                    | Request::SetSocdPower(_),
+                    | Request::SetSocdPower(_)
+                    | Request::SaveMacros(_),
                 ) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
@@ -168,6 +173,7 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
             Ok(Request::SaveColours(layer, colours)) => save_colours(keyboard, layer, &colours, &link),
             Ok(Request::SaveSocdPairs(pairs)) => save_socd_pairs(keyboard, &pairs, &link),
             Ok(Request::SetSocdPower(on)) => set_socd_power(keyboard, on, &link),
+            Ok(Request::SaveMacros(macros)) => save_macros(keyboard, &macros, &link),
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -352,6 +358,32 @@ fn save_socd_pairs(
     Ok(())
 }
 
+fn save_macros(kb: &mut Keyboard, macros: &[Option<Macro>], link: &Link) -> fizz::device::Result<()> {
+    match kb.write_macros(macros) {
+        Ok(Some(stored)) => {
+            let verified = stored == macros;
+            link.send(Update::MacrosSaved(stored));
+            if !verified {
+                link.send(Update::Error(
+                    "The keyboard saved different macros than were sent. The page now shows what it stored."
+                        .into(),
+                ));
+            }
+        }
+        Ok(None) => {
+            link.send(Update::Error(
+                "Couldn't read the macros back after saving. Read the keyboard again to check them."
+                    .into(),
+            ));
+        }
+        Err(fizz::device::Error::Incomplete) => {
+            link.send(Update::Error("The macro list is incomplete, so it wasn't saved.".into()));
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 fn set_socd_power(kb: &mut Keyboard, on: bool, link: &Link) -> fizz::device::Result<()> {
     let stored = kb.set_socd_power(on)?;
     link.send(Update::SocdPowerSet(stored));
@@ -407,6 +439,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
     let colours = colour_layer.and_then(|layer| kb.read_colours(layer).ok().flatten());
     let socd_pairs = kb.read_socd_pairs().ok().flatten();
     let socd_power = kb.read_socd_power().ok().flatten();
+    let macros = kb.read_macros().ok().flatten();
     Snapshot {
         status,
         product,
@@ -422,5 +455,6 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         colours,
         socd_pairs,
         socd_power,
+        macros,
     }
 }

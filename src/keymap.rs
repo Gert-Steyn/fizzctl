@@ -277,7 +277,7 @@ pub fn describe(action: KeyAction) -> String {
         return def.name.to_owned();
     }
     match action.kind {
-        kind::MACRO => format!("Macro {}", action.arg1),
+        kind::MACRO => format!("Macro {}", action.arg1 as usize + 1),
         _ => format!(
             "Custom {:02X} {:02X} {:02X} {:02X}",
             action.kind, action.code, action.arg1, action.arg2

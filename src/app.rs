@@ -11,6 +11,7 @@ use crate::graphite::{self, Tone, Type, size, space};
 use crate::actuation_page::ActuationPage;
 use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::keymap_page::{KeymapPage, Outcome};
+use crate::macros_page::MacrosPage;
 use crate::socd_page::SocdPage;
 use crate::worker::{LogEntry, Request, Snapshot, Update, Worker};
 
@@ -41,6 +42,7 @@ enum Page {
     Keymap,
     Actuation,
     Socd,
+    Macros,
     Lighting,
     Packets,
     Settings,
@@ -53,6 +55,7 @@ impl Page {
             Page::Keymap => "Key mapping",
             Page::Actuation => "Actuation",
             Page::Socd => "Snap tap",
+            Page::Macros => "Macros",
             Page::Lighting => "Lighting",
             Page::Packets => "Packet log",
             Page::Settings => "Settings",
@@ -65,6 +68,7 @@ impl Page {
             Page::Keymap => Icon::Keyboard,
             Page::Actuation => Icon::Gauge,
             Page::Socd => Icon::ArrowLeftRight,
+            Page::Macros => Icon::ListVideo,
             Page::Lighting => Icon::Lightbulb,
             Page::Packets => Icon::Terminal,
             Page::Settings => Icon::Settings,
@@ -89,6 +93,7 @@ pub struct FizzApp {
     keymap: KeymapPage,
     actuation: ActuationPage,
     socd: SocdPage,
+    macros: MacrosPage,
     applying: bool,
     /// Per-key colours being edited (Custom effect); `None` until read.
     colour_edit: Option<Vec<[u8; 3]>>,
@@ -121,6 +126,7 @@ impl FizzApp {
             "keys" => Page::Keymap,
             "actuation" => Page::Actuation,
             "socd" => Page::Socd,
+            "macros" => Page::Macros,
             "lighting" => Page::Lighting,
             "packets" => Page::Packets,
             "settings" => Page::Settings,
@@ -146,6 +152,7 @@ impl FizzApp {
             keymap,
             actuation,
             socd: SocdPage::default(),
+            macros: MacrosPage::default(),
             applying: false,
             colour_edit: None,
             brush: [0xFF, 0xFF, 0xFF],
@@ -174,6 +181,7 @@ impl FizzApp {
                     self.keymap.reset();
                     self.actuation.reset();
                     self.socd.reset();
+                    self.macros.reset();
                 }
                 Update::Snapshot(snapshot) => {
                     let device_light = self.snapshot.as_ref().and_then(|s| s.light);
@@ -194,6 +202,8 @@ impl FizzApp {
                     self.keymap.on_snapshot(&snapshot);
                     self.actuation.on_snapshot(&snapshot);
                     self.socd.on_snapshot(&snapshot);
+                    self.macros.on_snapshot(&snapshot);
+                    self.keymap.set_macros(self.macros.defined());
                     self.snapshot = Some(*snapshot);
                 }
                 Update::LightApplied(stored) => {
@@ -243,6 +253,14 @@ impl FizzApp {
                     self.socd.on_pairs_saved(stored);
                     self.notify(Notice::Success("SOCD pairs saved to the keyboard.".into()));
                 }
+                Update::MacrosSaved(stored) => {
+                    if let Some(s) = self.snapshot.as_mut() {
+                        s.macros = Some(stored.clone());
+                    }
+                    self.macros.on_saved(stored);
+                    self.keymap.set_macros(self.macros.defined());
+                    self.notify(Notice::Success("Macros saved to the keyboard.".into()));
+                }
                 Update::SocdPowerSet(power) => {
                     if let Some(s) = self.snapshot.as_mut()
                         && power.is_some()
@@ -275,6 +293,7 @@ impl FizzApp {
                     self.keymap.on_error();
                     self.actuation.on_error();
                     self.socd.on_error();
+                    self.macros.on_error();
                     self.notify(Notice::Error(message));
                 }
                 Update::Packet(entry) => {
@@ -311,6 +330,7 @@ impl FizzApp {
             Page::Keymap,
             Page::Actuation,
             Page::Socd,
+            Page::Macros,
             Page::Lighting,
             Page::Packets,
         ] {
@@ -856,6 +876,11 @@ impl eframe::App for FizzApp {
                             Page::Socd => {
                                 if self.connected_or_placeholder(ui).is_some() {
                                     self.socd.show(ui, &self.worker.tx);
+                                }
+                            }
+                            Page::Macros => {
+                                if self.connected_or_placeholder(ui).is_some() {
+                                    self.macros.show(ui, &self.worker.tx);
                                 }
                             }
                             Page::Lighting => self.lighting(ui),

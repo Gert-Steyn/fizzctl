@@ -24,6 +24,7 @@ pub mod cmd {
     pub const KEYMAP: u8 = 0x18;
     pub const CUSTOM_COLOURS: u8 = 0x09;
     pub const SOCD: u8 = 0x24;
+    pub const MACRO: u8 = 0x19;
     pub const SERIAL: u8 = 0x15;
     pub const PROFILE_TRIGGER: u8 = 0x21;
 
@@ -875,6 +876,175 @@ pub fn socd_power_write(on: bool) -> Packet {
     p
 }
 
+// ---------------------------------------------------------------------------
+// Macros (command 0x19)
+// ---------------------------------------------------------------------------
+
+pub const MACRO_SLOTS: usize = 10;
+/// Bytes stored per macro slot.
+pub const MACRO_BYTES: usize = 256;
+const MACRO_PAGE_BYTES: usize = 58;
+pub const MACRO_LAST_PAGE: u16 = 4;
+const MACRO_HEADER: usize = 8;
+/// The vendor app's limit: 20 key presses, each a press and a release.
+pub const MACRO_MAX_STEPS: usize = 40;
+
+/// How a macro plays when its key is pressed.
+pub mod macro_play {
+    pub const ONCE: u8 = 0;
+    /// Play `count` times (1–99).
+    pub const TIMES: u8 = 1;
+    /// Press to start, press again to stop.
+    pub const TOGGLE: u8 = 2;
+    /// Repeat while the key is held.
+    pub const WHILE_HELD: u8 = 3;
+
+    pub const ALL: [u8; 4] = [ONCE, TIMES, TOGGLE, WHILE_HELD];
+
+    pub fn name(play: u8) -> &'static str {
+        match play {
+            ONCE => "Play once",
+            TIMES => "Play a number of times",
+            TOGGLE => "Press to start, press again to stop",
+            WHILE_HELD => "Repeat while held",
+            _ => "Unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MacroStep {
+    /// Key down (true) or key up.
+    pub press: bool,
+    /// A mouse button (`code` is a button bit: 1 left, 2 right, 4 middle,
+    /// 8 forward, 16 back) instead of a key (`code` is a HID usage).
+    pub mouse: bool,
+    pub code: u8,
+    /// Wait after this step before the next one, in milliseconds.
+    pub delay_ms: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Macro {
+    pub play: u8,
+    /// Repeat count, used when `play` is [`macro_play::TIMES`].
+    pub count: u16,
+    pub steps: Vec<MacroStep>,
+}
+
+pub fn macro_request(slot: usize) -> Packet {
+    let mut p = packet(cmd::MACRO);
+    p[1] = 0x80 + slot as u8;
+    p
+}
+
+/// Reassemble a slot's 256 raw bytes from its pages. Handles both layouts
+/// the vendor app accepts: flat (pages are consecutive 58-byte chunks) and
+/// "paged" (every page repeats the 8-byte header before its steps).
+pub fn macro_raw(slot: usize, pages: &[Packet]) -> Option<[u8; MACRO_BYTES]> {
+    let mut flat = [0u8; MACRO_BYTES];
+    let first = pages
+        .iter()
+        .find(|r| r[0] == cmd::MACRO && r[1] == 0x80 + slot as u8 && page(r) == 0)?;
+    let take = (first[4] as usize).min(MACRO_PAGE_BYTES);
+    flat[..take].copy_from_slice(&first[PAYLOAD_OFFSET..PAYLOAD_OFFSET + take]);
+    let header = flat;
+    let mut paged = None;
+    for r in pages {
+        let n = page(r) as usize;
+        if r[0] != cmd::MACRO || r[1] != 0x80 + slot as u8 || n == 0 || n > MACRO_LAST_PAGE as usize {
+            continue;
+        }
+        let len = (r[4] as usize).min(MACRO_PAGE_BYTES);
+        let body = &r[PAYLOAD_OFFSET..PAYLOAD_OFFSET + len];
+        let is_paged = *paged.get_or_insert(
+            len >= MACRO_HEADER
+                && body[0] & 0x7F == header[0] & 0x7F
+                && body[1] == header[1]
+                && body[3] == header[3],
+        );
+        if is_paged {
+            // Steps after a repeated header, 50 bytes of steps per page.
+            let at = MACRO_HEADER + 50 * n;
+            let data = &body[MACRO_HEADER.min(len)..];
+            if at + data.len() <= MACRO_BYTES {
+                flat[at..at + data.len()].copy_from_slice(data);
+            }
+        } else {
+            let at = MACRO_PAGE_BYTES * n;
+            let end = (at + len).min(MACRO_BYTES);
+            flat[at..end].copy_from_slice(&body[..end - at]);
+        }
+    }
+    Some(flat)
+}
+
+/// Decode a slot's raw bytes. `None` for an empty slot (erased `FF`s or zeros).
+pub fn parse_macro(raw: &[u8; MACRO_BYTES]) -> Option<Macro> {
+    let step_bytes = raw[3] as usize;
+    if !(4..=MACRO_BYTES - MACRO_HEADER).contains(&step_bytes) {
+        return None;
+    }
+    let steps = raw[MACRO_HEADER..MACRO_HEADER + step_bytes]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|s| MacroStep {
+            press: s[1] >> 4 == 1,
+            mouse: s[1] & 0x0F == 1,
+            code: s[0],
+            delay_ms: u16::from_be_bytes([s[2], s[3]]),
+        })
+        .collect();
+    Some(Macro {
+        play: raw[1],
+        count: u16::from_be_bytes([raw[4], raw[5]]).max(1),
+        steps,
+    })
+}
+
+/// The 256 bytes for a slot; `None` writes an empty (all-zero) slot.
+pub fn macro_bytes(slot: usize, m: Option<&Macro>) -> [u8; MACRO_BYTES] {
+    let mut raw = [0u8; MACRO_BYTES];
+    let Some(m) = m else { return raw };
+    let steps = &m.steps[..m.steps.len().min((MACRO_BYTES - MACRO_HEADER) / 4)];
+    raw[0] = slot as u8 & 0x7F;
+    raw[1] = m.play;
+    raw[3] = (steps.len() * 4) as u8;
+    let count = if m.play == macro_play::TIMES { m.count.max(1) } else { 1 };
+    raw[4..6].copy_from_slice(&count.to_be_bytes());
+    for (i, s) in steps.iter().enumerate() {
+        let at = MACRO_HEADER + i * 4;
+        let [hi, lo] = s.delay_ms.to_be_bytes();
+        raw[at..at + 4].copy_from_slice(&[s.code, (s.press as u8) << 4 | s.mouse as u8, hi, lo]);
+    }
+    raw
+}
+
+/// The vendor app's "delete macro" command for a macro index.
+pub fn macro_delete(index: usize) -> Packet {
+    let mut p = packet(cmd::MACRO);
+    p[1] = 0x03;
+    p[4] = index as u8;
+    p
+}
+
+/// Packets writing a slot's raw bytes (flat layout, 5 pages). The keyboard
+/// confirms each page with `[19, slot]`.
+pub fn macro_write(slot: usize, raw: &[u8; MACRO_BYTES]) -> Vec<Packet> {
+    raw.chunks(MACRO_PAGE_BYTES)
+        .enumerate()
+        .map(|(n, chunk)| {
+            let mut p = packet(cmd::MACRO);
+            p[1] = slot as u8;
+            p[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+            p[4] = chunk.len() as u8;
+            p[PAYLOAD_OFFSET..PAYLOAD_OFFSET + chunk.len()].copy_from_slice(chunk);
+            p
+        })
+        .collect()
+}
+
 /// Start the live travel test for `slots`: the keyboard then streams
 /// [`parse_travel`] packets while keys move. Stop it with [`travel_test_stop`].
 pub fn travel_test_start(slots: &[usize]) -> Packet {
@@ -1088,6 +1258,40 @@ mod tests {
             .collect();
         assert_eq!(parse_socd_pairs(&replies), Some(slots));
         assert_eq!(&socd_power_write(true)[..6], &[0x24, 0x03, 0, 0, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn macro_round_trips_and_empty_slots_parse_as_empty() {
+        let m = Macro {
+            play: macro_play::TIMES,
+            count: 3,
+            steps: vec![
+                MacroStep { press: true, mouse: false, code: 0x04, delay_ms: 30 },
+                MacroStep { press: false, mouse: false, code: 0x04, delay_ms: 500 },
+                MacroStep { press: true, mouse: true, code: 0x01, delay_ms: 20 },
+                MacroStep { press: false, mouse: true, code: 0x01, delay_ms: 0 },
+            ],
+        };
+        let raw = macro_bytes(7, Some(&m));
+        assert_eq!(&raw[..8], &[7, 1, 0, 16, 0, 3, 0, 0]);
+        let packets = macro_write(7, &raw);
+        assert_eq!(packets.len(), 5);
+        assert_eq!(packets[4][4], 24); // 4 × 58 + 24 = 256
+        let replies: Vec<Packet> = packets
+            .iter()
+            .map(|p| {
+                let mut r = *p;
+                r[1] = 0x80 + 7;
+                r
+            })
+            .collect();
+        let back = macro_raw(7, &replies).unwrap();
+        assert_eq!(back, raw);
+        assert_eq!(parse_macro(&back), Some(m));
+
+        // Erased flash (as read from the real keyboard) and zeros are empty.
+        assert_eq!(parse_macro(&[0xFF; MACRO_BYTES]), None);
+        assert_eq!(parse_macro(&macro_bytes(0, None)), None);
     }
 
     #[test]

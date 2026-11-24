@@ -83,6 +83,9 @@ pub struct KeymapWrite {
     pub verified: bool,
 }
 
+/// How long to wait for the keyboard to confirm a macro page (the vendor app waits 100 ms).
+const MACRO_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Result of [`Keyboard::write_colours`].
 #[derive(Clone, Debug)]
 pub struct ColourWrite {
@@ -401,6 +404,78 @@ impl Keyboard {
             verified: stored.as_deref() == Some(colours),
             stored,
         })
+    }
+
+    /// A macro slot's 256 raw bytes. `None` when page 0 was missing.
+    pub fn read_macro_raw(&mut self, slot: usize) -> Result<Option<[u8; protocol::MACRO_BYTES]>> {
+        let pages = self.request_pages(
+            "macro",
+            &protocol::macro_request(slot),
+            protocol::MACRO_LAST_PAGE,
+            REPLY_TIMEOUT,
+            PAGE_IDLE,
+        )?;
+        Ok(protocol::macro_raw(slot, &pages))
+    }
+
+    /// Write a macro slot's raw bytes (waiting briefly for each page's
+    /// confirmation), then read the slot back.
+    pub fn write_macro_raw(
+        &mut self,
+        slot: usize,
+        raw: &[u8; protocol::MACRO_BYTES],
+    ) -> Result<Option<[u8; protocol::MACRO_BYTES]>> {
+        for packet in protocol::macro_write(slot, raw) {
+            match self.request(
+                "macro page",
+                &packet,
+                |r| r[0] == protocol::cmd::MACRO && r[1] as usize == slot,
+                MACRO_ACK_TIMEOUT,
+            ) {
+                Ok(_) | Err(Error::Timeout(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.read_macro_raw(slot)
+    }
+
+    /// Every macro slot, decoded; `None` overall if any slot didn't read.
+    pub fn read_macros(&mut self) -> Result<Option<Vec<Option<protocol::Macro>>>> {
+        let mut out = Vec::with_capacity(protocol::MACRO_SLOTS);
+        for slot in 0..protocol::MACRO_SLOTS {
+            match self.read_macro_raw(slot)? {
+                Some(raw) => out.push(protocol::parse_macro(&raw)),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Save all 10 macro slots in order from slot 0, then read them back.
+    /// Macro memory is flash that only erases when the full set is written
+    /// from slot 0, so slots can never be saved one at a time.
+    pub fn write_macros(
+        &mut self,
+        macros: &[Option<protocol::Macro>],
+    ) -> Result<Option<Vec<Option<protocol::Macro>>>> {
+        if macros.len() != protocol::MACRO_SLOTS {
+            return Err(Error::Incomplete);
+        }
+        for (slot, m) in macros.iter().enumerate() {
+            let raw = protocol::macro_bytes(slot, m.as_ref());
+            for packet in protocol::macro_write(slot, &raw) {
+                match self.request(
+                    "macro page",
+                    &packet,
+                    |r| r[0] == protocol::cmd::MACRO && r[1] as usize == slot,
+                    MACRO_ACK_TIMEOUT,
+                ) {
+                    Ok(_) | Err(Error::Timeout(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        self.read_macros()
     }
 
     /// All 20 SOCD pair slots. `None` when a page was missing.

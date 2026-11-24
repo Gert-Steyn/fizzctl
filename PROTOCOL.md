@@ -205,6 +205,23 @@ The vendor code calls this "PRCS"; its status flag (support byte 9) means SOCD s
 * Stock: one pair A (04) + D (07), mode 0, SOCD off. Writing the pairs and the off state back
   unchanged was verified, and writing pairs did not change the on/off state.
 
+## Macros (`0x19`), confirmed on the real keyboard
+
+* 10 slots × 256 bytes. Read `19 80+slot` → pages 0–4 (58 bytes each, last 24). Erased slots read
+  as all `FF`; the vendor app writes unused slots as all zeros. Both mean empty.
+* Layout: `[index, play, 0, 4 × steps, count_hi, count_lo, 0, 0]`, then up to 62 steps of
+  `[code, press << 4 | mouse, delay_hi, delay_lo]`: `code` is a HID usage (or a mouse button bit:
+  1 left, 2 right, 4 middle, 8 forward, 16 back when `mouse` = 1), and the delay is the wait
+  *after* the step in ms. Play: 0 once, 1 `count` times, 2 press to start/stop, 3 repeat while held.
+  The vendor app allows 40 steps (20 press/release pairs) and requires every press to be released.
+* Write `19 slot page len` + 58-byte chunks of the 256 bytes; the keyboard confirms pages with `[19, slot]`.
+* **Flash quirk:** writes program flash without erasing it, so bits only go from 1 to 0. A write
+  to one slot only works on an erased (`FF`) slot; writing `FF` back is ignored and data written
+  over zeros reads back as zeros. Writing **all 10 slots in order from slot 0**, as the vendor app
+  always does, works in every case (the keyboard evidently erases the macro area at slot 0).
+  `19 03 .. .. index` (the vendor app's "delete") did not erase a slot.
+* Assigning a macro to a key: key-map entry `[0x10, the key's own HID code, macro slot, 0]`.
+
 ## Other features (read-only survey, 2026-11-24)
 
 | Command | Reply on this keyboard |

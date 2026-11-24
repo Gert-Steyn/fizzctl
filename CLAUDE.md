@@ -40,13 +40,17 @@ cargo run --bin fizz-probe -- --rewrite-colours [--layer 0|1]  # NOT a no-op: ac
 cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1   # set lighting: mode bri spd fg bg dir rainbow
 cargo run --bin fizz-probe -- --rewrite-socd     # SOCD pairs + on/off back unchanged, verifies
 cargo run --bin fizz-probe -- --survey           # read-only check of features not built yet
+cargo run --bin fizz-probe -- --read-macros      # read-only: all slots + which keys use macros
+cargo run --bin fizz-probe -- --macro-write-all-test  # all slots empty & unbound only: write a test macro, clear again
+cargo run --bin fizz-probe -- --dump-macro <slot>     # read-only raw bytes of one slot
 cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked  # live travel test on one key; only for agreed experiments
 cargo test                                   # unit tests (protocol + keymap)
 cargo clippy --all-targets                   # 1 expected warning, in src/graphite.rs (see below)
 ```
 
 Dev-only env vars for screenshots (not persisted): `FIZZ_EFFECT=custom` (preview the Custom
-effect on the Lighting page), `FIZZ_PAGE=keys|actuation|lighting|packets|settings`,
+effect on the Lighting page), `FIZZ_MACRO_DEMO=1` (unsaved sample in macro slot 1),
+`FIZZ_PAGE=keys|actuation|socd|macros|lighting|packets|settings`,
 `FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps, 22 = Esc; key mapping and actuation),
 `FIZZ_LAYER=fn`.
 
@@ -65,6 +69,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `src/keymap_page.rs` | Key mapping page: layer switch, picker, save. |
 | `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
 | `src/socd_page.rs` | Snap tap (SOCD) page: on/off (immediate), key pairs with modes, save. |
+| `src/macros_page.rs` | Macros page: 10 slots list + editor (play mode, steps, delays); saves all 10. Key mapping's picker offers defined macros. |
 | `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
 | `src/graphite.rs` | Copy of the Graphite egui theme module plus local additions (see Design). |
 | `src/bin/fizz-probe.rs` | CLI diagnostics and the key-map write-back test. |
@@ -155,6 +160,15 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   payload `[0]` on, `[4] [5]` = toggle keys (`FA E5`); set `[1]=3 [4]=1 [5]=on`. Modes: 0 last
   input wins, 1 key 1 priority (vendor default), 2 key 2 priority, 3 neutral. No-op write of pairs
   and on/off verified 2026-11-24; writing pairs does **not** turn SOCD on, and touched nothing else.
+- **Macros `0x19` (2026-11-24):** 10 slots × 256 bytes (5 pages of 58), read `[1]=0x80+slot`,
+  write `[1]=slot` (each page confirmed `[19, slot]`). Header `[index, play, 0, 4×steps, countHi,
+  countLo, 0, 0]`, then steps `[code, press<<4 | mouse, delayHi, delayLo]` (delay = wait *after*
+  the step, ms). Play: 0 once, 1 N times (1–99), 2 toggle, 3 while held. Key binding: key-map
+  `[0x10, key's own hid, macro slot, 0]`. **Writes program flash without erasing**: a single-slot
+  write only works on an erased (FF) slot (bits can only go 1→0). Writing **all 10 slots in order
+  from slot 0** (what the vendor app always does) works both ways, so the app must always save all
+  10 together. Writing an `FF` header is ignored; `19 03 .. .. idx` ("delete") did not erase.
+  Verified with `--macro-write-all-test` (all slots empty, no key bound; left empty afterwards).
 - Polling rate write `0x21 [5]=9 [6]=1 [7]=1|2|4|8` (no reply; read back). No-op write verified
   2026-11-24 (8000 → 8000).
 - **Live travel test incident (2026-11-24):** `0x21 [4]=0x18 [5]=2` + all 61 keys in the bitmap
@@ -199,6 +213,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
 | Polling rate (1/2/4/8 kHz on Overview, applies immediately) | Done. No-op write verified; a real change via the GUI not yet tried |
 | Per-key colours (Custom effect: paint keys on the Lighting page) | Done. Read verified; colour write verified (acks + read-back); lighting write verified via probe. Painting from the GUI not yet tried |
+| Macros: 10 slots, play modes, key/mouse steps with delays; assign via Key mapping | Done. Read verified; save path verified with the vendor-style all-slots write (test macro in, cleared again). Saving a real macro via the GUI and assigning it not yet tried. No recording yet |
 | Snap tap (SOCD): on/off, up to 20 pairs with 4 modes | Done. Read verified; no-op writes verified; a real change via the GUI not yet tried |
 | Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
 | Packet log | Done |
@@ -225,7 +240,9 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 3. ~~Per-key RGB~~ done 2026-11-24 (edits the active colour layer only). Possible follow-ups:
    switch between the two colour layers (writing a layer activates it), drag-to-paint, presets.
 4. ~~SOCD~~ done 2026-11-24 (not originally on the list; found by the survey).
-5. **Macros.** `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
+5. ~~Macros~~ done 2026-11-24 (editor; save writes all 10 slots). Follow-up: **record** steps by
+   typing (egui reports no events for lone modifier keys, so Shift/Ctrl need special handling).
+   Original notes: `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
    delete `[1]=3 [4]=index`. Step = `{keyCode, type|state<<4, delayHi, delayLo}`. Key-map kind `0x10`
    with `arg1` = macro index. Needs a recorder UI.
 6. Then: calibration (ask first); dead zones and advanced keys only after a test proves the

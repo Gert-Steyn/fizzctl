@@ -31,6 +31,8 @@ pub struct KeymapPage {
     edit_default: Option<Vec<KeyAction>>,
     edit_fn: Option<Vec<KeyAction>>,
     saving: HashSet<Layer>,
+    /// Which macro slots hold a macro, for the picker.
+    macros: Vec<bool>,
 }
 
 impl KeymapPage {
@@ -65,6 +67,10 @@ impl KeymapPage {
 
     fn any_changed(&self) -> bool {
         self.is_changed(Layer::Default) || self.is_changed(Layer::Fn)
+    }
+
+    pub fn set_macros(&mut self, defined: Vec<bool>) {
+        self.macros = defined;
     }
 
     pub fn select(&mut self, slot: usize) {
@@ -343,6 +349,33 @@ impl KeymapPage {
                                     .min_size(Vec2::new(size::CONTROL_SM, size::CONTROL_SM));
                                 if ui.add(option).clicked() {
                                     chosen = Some(def.action);
+                                }
+                            }
+                        });
+                    }
+                    // Macros that exist on the keyboard. The key-map entry
+                    // is [0x10, the key's own code, macro slot, 0].
+                    let macro_options: Vec<(usize, String)> = self
+                        .macros
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, defined)| **defined)
+                        .map(|(slot, _)| (slot, format!("Macro {}", slot + 1)))
+                        .filter(|(_, name)| query.is_empty() || name.to_lowercase().contains(&query))
+                        .collect();
+                    if !macro_options.is_empty() {
+                        any = true;
+                        graphite::group_header(ui, "Macros");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::splat(space::S2);
+                            for (slot, name) in macro_options {
+                                let action =
+                                    KeyAction::new(keymap::kind::MACRO, phys.default.code, slot as u8, 0);
+                                let option = egui::Button::new(graphite::text(name, Type::Body))
+                                    .selected(current.kind == keymap::kind::MACRO && current.arg1 as usize == slot)
+                                    .min_size(Vec2::new(size::CONTROL_SM, size::CONTROL_SM));
+                                if ui.add(option).clicked() {
+                                    chosen = Some(action);
                                 }
                             }
                         });

@@ -10,6 +10,8 @@ use fizz::protocol::{self as p, Layer, LightConfig};
 use crate::graphite::{self, Tone, Type, size, space};
 use crate::actuation_page::ActuationPage;
 use crate::backup::BackupSection;
+use crate::calibration_page::CalibrationPage;
+use crate::key_test_page::KeyTestPage;
 use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::keymap_page::{KeymapPage, Outcome};
 use crate::macros_page::MacrosPage;
@@ -42,6 +44,8 @@ enum Page {
     Overview,
     Keymap,
     Actuation,
+    Calibration,
+    KeyTest,
     Socd,
     Macros,
     Lighting,
@@ -55,6 +59,8 @@ impl Page {
             Page::Overview => "Overview",
             Page::Keymap => "Key mapping",
             Page::Actuation => "Actuation",
+            Page::Calibration => "Calibration",
+            Page::KeyTest => "Key test",
             Page::Socd => "Snap tap",
             Page::Macros => "Macros",
             Page::Lighting => "Lighting",
@@ -68,6 +74,8 @@ impl Page {
             Page::Overview => Icon::Info,
             Page::Keymap => Icon::Keyboard,
             Page::Actuation => Icon::Gauge,
+            Page::Calibration => Icon::Crosshair,
+            Page::KeyTest => Icon::Activity,
             Page::Socd => Icon::ArrowLeftRight,
             Page::Macros => Icon::ListVideo,
             Page::Lighting => Icon::Lightbulb,
@@ -96,6 +104,8 @@ pub struct FizzApp {
     socd: SocdPage,
     macros: MacrosPage,
     backup: BackupSection,
+    calibration: CalibrationPage,
+    key_test: KeyTestPage,
     applying: bool,
     /// Per-key colours being edited (Custom effect); `None` until read.
     colour_edit: Option<Vec<[u8; 3]>>,
@@ -127,6 +137,8 @@ impl FizzApp {
         let page = match env("FIZZ_PAGE").as_str() {
             "keys" => Page::Keymap,
             "actuation" => Page::Actuation,
+            "calibration" => Page::Calibration,
+            "keytest" => Page::KeyTest,
             "socd" => Page::Socd,
             "macros" => Page::Macros,
             "lighting" => Page::Lighting,
@@ -156,6 +168,8 @@ impl FizzApp {
             socd: SocdPage::default(),
             macros: MacrosPage::default(),
             backup: BackupSection::new(),
+            calibration: CalibrationPage::new(),
+            key_test: KeyTestPage::new(),
             applying: false,
             colour_edit: None,
             brush: [0xFF, 0xFF, 0xFF],
@@ -186,6 +200,8 @@ impl FizzApp {
                     self.socd.reset();
                     self.macros.reset();
                     self.backup.on_error();
+                    self.calibration.reset();
+                    self.key_test.reset();
                 }
                 Update::Snapshot(snapshot) => {
                     let device_light = self.snapshot.as_ref().and_then(|s| s.light);
@@ -279,6 +295,16 @@ impl FizzApp {
                         )));
                     }
                 }
+                Update::CalibrationStarted(log) => self.calibration.on_started(log),
+                Update::Calibration(event) => self.calibration.on_event(event),
+                Update::CalibrationStopped => {
+                    if let Some(message) = self.calibration.on_stopped() {
+                        self.notify(Notice::Success(message));
+                    }
+                }
+                Update::TravelStarted { config, triggers } => self.key_test.on_started(config, triggers),
+                Update::Travel(batch) => self.key_test.on_travel(batch),
+                Update::TravelStopped => self.key_test.on_stopped(),
                 Update::ProfileSaved(result) => match self.backup.on_saved(result) {
                     Ok(message) => self.notify(Notice::Success(message)),
                     Err(message) => self.notify(Notice::Error(message)),
@@ -300,6 +326,8 @@ impl FizzApp {
                 }
                 Update::Error(message) => {
                     self.backup.on_error();
+                    self.calibration.on_error();
+                    self.key_test.on_error();
                     self.setting_poll_rate = None;
                     self.saving_colours = false;
                     self.applying = false;
@@ -342,6 +370,8 @@ impl FizzApp {
             Page::Overview,
             Page::Keymap,
             Page::Actuation,
+            Page::Calibration,
+            Page::KeyTest,
             Page::Socd,
             Page::Macros,
             Page::Lighting,
@@ -739,6 +769,7 @@ impl FizzApp {
                         main_color: p.text,
                         unsaved: stored.as_ref().is_some_and(|s| s[key.slot] != c),
                         swatch: Some(c),
+                    done: false,
                         tooltip: format!("{}: {}", key.label, hex_color(c)),
                     }
                 },
@@ -871,6 +902,13 @@ impl eframe::App for FizzApp {
         if self.page != Page::Settings {
             self.backup.invalidate();
         }
+        // Never leave the keyboard calibrating once the page is closed.
+        if self.page != Page::Calibration {
+            self.calibration.leave(&self.worker.tx);
+        }
+        if self.page != Page::KeyTest {
+            self.key_test.leave(&self.worker.tx);
+        }
         let dark = ui.visuals().dark_mode;
 
         egui::Panel::left("sidebar")
@@ -898,6 +936,16 @@ impl eframe::App for FizzApp {
                     Page::Actuation => {
                         if self.connected_or_placeholder(ui).is_some() {
                             self.actuation.show(ui, &self.worker.tx);
+                        }
+                    }
+                    Page::Calibration => {
+                        if self.connected_or_placeholder(ui).is_some() {
+                            self.calibration.show(ui, &self.worker.tx);
+                        }
+                    }
+                    Page::KeyTest => {
+                        if self.connected_or_placeholder(ui).is_some() {
+                            self.key_test.show(ui, &self.worker.tx);
                         }
                     }
                     page => {

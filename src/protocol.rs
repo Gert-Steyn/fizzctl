@@ -1062,6 +1062,62 @@ pub fn travel_test_stop() -> Packet {
     trigger_packet(0x03)
 }
 
+// ---------------------------------------------------------------------------
+// Switch calibration (command 0x21, byte 4 = 0x18, sub-command 0x08)
+// ---------------------------------------------------------------------------
+//
+// Start calibration, then press every key all the way down and hold it until
+// the keyboard reports it as done. The keyboard pushes progress messages with
+// a bitmap of the keys finished so far. Calibration data can't be read back
+// or backed up, so the only undo is calibrating again.
+
+/// Begin calibrating all keys.
+pub fn calibration_start() -> Packet {
+    trigger_packet(0x08)
+}
+
+/// Leave calibration. Safe to send when none is running.
+pub fn calibration_stop() -> Packet {
+    let mut p = trigger_packet(0x08);
+    p[6] = 0x01;
+    p
+}
+
+/// A calibration message pushed by the keyboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CalibrationEvent {
+    /// Keys calibrated so far, as key slots (`22 * row + col`).
+    Progress(Vec<usize>),
+    /// The keyboard says calibration is complete.
+    Finished,
+    /// The keyboard gave up; the code is the raw status byte.
+    Failed(u8),
+}
+
+/// Parse a pushed calibration message. Also covers the single-key (`07`) and
+/// any-key (`0F`) variants, which share the layout.
+pub fn parse_calibration(packet: &Packet) -> Option<CalibrationEvent> {
+    if packet[0] != cmd::PROFILE_TRIGGER || !matches!(packet[5], 0x07 | 0x08 | 0x0F) {
+        return None;
+    }
+    match packet[6] {
+        0 => Some(CalibrationEvent::Finished),
+        1 => {
+            let mut slots = Vec::new();
+            for (col, byte) in packet[7..7 + TRIGGER_COLS].iter().enumerate() {
+                for row in 0..6 {
+                    if byte >> row & 1 == 1 {
+                        slots.push(TRIGGER_COLS * row + col);
+                    }
+                }
+            }
+            Some(CalibrationEvent::Progress(slots))
+        }
+        2 | 4 => Some(CalibrationEvent::Failed(packet[6])),
+        _ => None,
+    }
+}
+
 /// A pushed travel report during the live test: `(slot, travel in steps)`.
 pub fn parse_travel(packet: &Packet) -> Option<(usize, u16)> {
     if packet[0] != cmd::PROFILE_TRIGGER || packet[5] != 0x01 {
@@ -1292,6 +1348,29 @@ mod tests {
         // Erased flash (as read from the real keyboard) and zeros are empty.
         assert_eq!(parse_macro(&[0xFF; MACRO_BYTES]), None);
         assert_eq!(parse_macro(&macro_bytes(0, None)), None);
+    }
+
+    #[test]
+    fn calibration_packets_and_events() {
+        assert_eq!(&calibration_start()[..7], &[0x21, 0, 0, 0, 0x18, 0x08, 0x00]);
+        assert_eq!(&calibration_stop()[..7], &[0x21, 0, 0, 0, 0x18, 0x08, 0x01]);
+        // Not blocked: starting and stopping calibration are ordinary commands.
+        assert!(!cmd::is_blocked(&calibration_start()));
+        assert!(!cmd::is_blocked(&calibration_stop()));
+
+        // Progress: Esc (row 1, col 0) and Fn (row 5, col 10) are done.
+        let mut progress = reply(&[0x21, 0, 0, 0, 0x18, 0x08, 0x01]);
+        progress[7] = 1 << 1;
+        progress[7 + 10] = 1 << 5;
+        assert_eq!(parse_calibration(&progress), Some(CalibrationEvent::Progress(vec![22, 120])));
+
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x18, 0x08, 0x00])), Some(CalibrationEvent::Finished));
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x18, 0x08, 0x02])), Some(CalibrationEvent::Failed(2)));
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x18, 0x08, 0x04])), Some(CalibrationEvent::Failed(4)));
+        // Other 0x21 traffic (poll rate, travel stream) and unknown statuses are not calibration.
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x02, 0x09, 0x08])), None);
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x03, 0x01, 5, 10, 1, 0])), None);
+        assert_eq!(parse_calibration(&reply(&[0x21, 0, 0, 0, 0x18, 0x08, 0x09])), None);
     }
 
     #[test]

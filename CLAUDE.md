@@ -52,9 +52,10 @@ cargo clippy --all-targets                   # 1 expected warning, in src/graphi
 ```
 
 Dev-only env vars for screenshots (not persisted): `FIZZ_EFFECT=custom` (preview the Custom
-effect on the Lighting page), `FIZZ_MACRO_DEMO=1` (unsaved sample in macro slot 1), `FIZZ_RECORD=1` (start recording into
+effect on the Lighting page), `FIZZ_CAL_DEMO=1` (calibration page shows a simulated run and sends nothing),
+`FIZZ_MACRO_DEMO=1` (unsaved sample in macro slot 1), `FIZZ_RECORD=1` (start recording into
 macro slot 1; used by `tools/record_test.ps1`),
-`FIZZ_PAGE=keys|actuation|socd|macros|lighting|packets|settings`,
+`FIZZ_PAGE=keys|actuation|calibration|socd|macros|lighting|packets|settings`,
 `FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps, 22 = Esc; key mapping and actuation),
 `FIZZ_LAYER=fn`.
 
@@ -68,17 +69,18 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `src/protocol.rs` | Pure packet builders/parsers, no I/O. Unit-tested. Blocked-command list lives here. |
 | `src/device.rs` | `Keyboard`: open by VID/PID/usage page, send/recv, `request`, `request_pages`, `read_keymap`, `write_keymap` (acks + storing wait + read-back), `wait_until_stored`, `read_trigger_config`, `read_key_triggers`, `write_key_triggers` (grouped + read-back). |
 | `src/keymap.rs` | Key catalogue (English names, wire order) and the 61-key `LAYOUT` with default actions. |
-| `src/worker.rs` | Background thread owning the connection: reconnect every 1 s, muted status heartbeat every 2 s, `Request` in / `Update` out, `read_snapshot`. |
+| `src/worker.rs` | Background thread owning the connection: reconnect every 1 s, muted status heartbeat every 2 s, `Request` in / `Update` out, `read_snapshot`. While a calibration session runs it polls every 30 ms instead (a heartbeat's drain would eat progress messages), refuses other requests, logs every event to `%APPDATA%\Fizz control\data\calibration\calibration-<time>.log`, and always sends the stop packet (page leave, app close, failure, cable pull). |
 | `src/app.rs` | Window shell (sidebar, toolbar), Overview, Lighting, Packet log, Settings pages. |
 | `src/keymap_page.rs` | Key mapping page: layer switch, picker, save. |
 | `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
 | `src/socd_page.rs` | Snap tap (SOCD) page: on/off (immediate), key pairs with modes, save. |
 | `src/macros_page.rs` | Macros page: 10 slots list + editor (play mode, steps, delays); saves all 10. Key mapping's picker offers defined macros. |
+| `src/calibration_page.rs` | Calibration page: instructions, start confirmation, live green-key drawing from the keyboard's progress messages, Stop/Finish. Stops calibrating whenever the page is left. |
 | `src/profile.rs` | Whole-keyboard settings file (library): `Profile` (9 optional sections, JSON, `problems()` validation, no serial number), `read(kb)`, `apply(kb, &profile)` (fixed order, lighting last, read-back per section, stops on a cable pull), UTC date helpers. |
 | `src/backup.rs` | Settings page "Backup and restore": save to file, list saved files, Restore with a confirmation dialog (warns on a different keyboard model). Files in the app data folder `profiles` (Windows: `%APPDATA%\Fizz control\data\profiles`). |
 | `src/recorder.rs` | Macro recorder core (egui-free, in the library): key-down/up events with timestamps become steps; keeps the macro valid (every press released, 40-step cap, releases owed reserved). `is_balanced` lives here. |
 | `src/capture.rs` | egui events to HID events for the recorder: `hid_code(egui::Key)`, `key_events` (reads `physical_key`, drops auto-repeat, turns `Copy`/`Cut`/`Paste` events back into C/X/V). |
-| `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
+| `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key incl. `swatch`/`done`, Ctrl/Shift-click to extend) and `capture_keys` (keep focus + lock Tab/arrows/Esc so key presses don't operate the UI; used by macro recording and calibration). |
 | `src/graphite.rs` | Copy of the Graphite egui theme module plus local additions (see Design). |
 | `src/bin/fizz-probe.rs` | CLI diagnostics and the key-map write-back test. |
 | `tools/decode_app.py` | Decrypt + de-obfuscate the vendor `app.js` statically. |
@@ -157,6 +159,10 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   (extended) for real arrows. Always check the foreground window title before sending input.
   `AppActivate(pid)` + `SetForegroundWindow` brings the app forward; `MoveWindow` resizes it. The
   screen work area is 1920x1032, so use mouse-wheel scrolling to see long pages.
+- UI tests: `tools/click.ps1` only acts while "Fizz control" is the foreground window, and it
+  refused to act when Gert's Chrome took focus (verified 2026-11-24): re-activate the app first
+  (`AppActivate` + `SetForegroundWindow`). Never start a second app instance before closing the first:
+  `tools/screenshot.ps1` grabs the first window with that title.
 - Windows Store Python can't see `%APPDATA%\Roaming` (it is virtualized): copy files out with
   PowerShell before reading them from Python.
 - Windows PowerShell 5.1 `Set-Content -Encoding utf8` writes a UTF-8 byte-order mark; the profile
@@ -198,6 +204,15 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   from slot 0** (what the vendor app always does) works both ways, so the app must always save all
   10 together. Writing an `FF` header is ignored; `19 03 .. .. idx` ("delete") did not erase.
   Verified with `--macro-write-all-test` (all slots empty, no key bound; left empty afterwards).
+- **Calibration `0x21 [4]=0x18 [5]=8` (verified on the real keyboard 2026-11-24):** start `[6]=0`,
+  stop `[6]=1`. The keyboard acknowledges the start within ~30 ms with an empty progress message, then
+  pushes a progress message `21 00 00 00 18 08 01 <22-byte bitmap>` whenever a key completes (bit =
+  row, byte = column, **cumulative**: each message lists every key done so far; 62 messages for 61
+  keys), and when all keys are done it sends `[6]=0` **Finished by itself** (it also carries the final
+  bitmap). Failed would be `[6]=2|4` (never seen). Stop after Finished was accepted and the keyboard
+  kept answering normally. Gert's run: one pass over the keys took 28 s. The single-key variant
+  `[5]=7 row col` and "any key" `[5]=0x0F` use the same layout and are unused. The vendor app says 2-3 presses per key, but it also shows a key as complete after one press, and Gert
+  calibrated with a single press per key and noticed no inaccuracy, so one pass is fine (his call, 2026-11-24). The session log of that run is the reference for the timings.
 - Polling rate write `0x21 [5]=9 [6]=1 [7]=1|2|4|8` (no reply; read back). No-op write verified
   2026-11-24 (8000 → 8000).
 - **Live travel test incident (2026-11-24):** `0x21 [4]=0x18 [5]=2` + all 61 keys in the bitmap
@@ -206,6 +221,20 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   "surprise removed as it is reported as missing on the bus" (Kernel-PnP 1010). It re-enumerated by
   itself; all settings were intact afterwards (checked read-only). Stop (`[5]=3`) could not be sent.
   Not yet known whether it's the full bitmap, a missing host heartbeat, or a firmware bug.
+- **Vendor live key test, captured from the vendor page (2026-11-24, `tools/capture_vendor_hid.js`,
+  Gert pasted the output):** the page sends exactly our start packet (`21 00 00 00 18 02 00 02`, all
+  keys in the bitmap) and the same stop (`[5]=3`). What differs from our first attempt: it reads the
+  actuation settings first, sends a **status request (`01`) every 1 s during the test without
+  discarding other input**, and reads the stream continuously. So the first reset was probably a
+  missing heartbeat or a drain that ate/starved the stream, not the bitmap itself (unproven). Built to
+  match: `Keyboard::start_travel_test` / `heartbeat` / `poll_travel` / `stop_travel_test`, probe
+  `--travel-session <secs>` (all keys, 1 s heartbeat, always stops, checks the keyboard answers), and
+  the worker's `TravelSession` (5 ms poll, 16 ms batches to the UI, stops on page leave, close, error).
+  **Result (Gert's run, 15 s, all 61 keys in the bitmap): stable.** 359 reports (up to 112/s), keys
+  Back/F/G/H/J seen, travel up to 3.40 mm, stop accepted, keyboard answered afterwards, no USB drop.
+  So the 61-key bitmap is fine; the first reset came from the missing heartbeat/draining.
+  The same capture showed the status byte for a feature flag flip once (Windows-key lock?); check that
+  Gert's Windows key works, Fn+Win may toggle it.
 - **Per-key colours `0x09` (2026-11-24):** read `[1]=0x80|layer`, 8 pages × 18 RGB (slot order),
   write `[1]=layer` (acked `[09, layer]`), active layer `[1]=0x20` → reply `[1]`. Both layers were
   all black. **A colour write is not a no-op**: writing a layer makes it the active layer
@@ -245,7 +274,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Macros: 10 slots, play modes, key/mouse steps with delays; assign via Key mapping | Done. Read verified; save path verified with the vendor-style all-slots write (test macro in, cleared again). Recording keys by typing is done and was tested with real key presses (letters, Shift+A, Ctrl+C, Space, F5, Tab, Enter, arrows; held key + focus loss). Saving a real macro via the GUI and assigning it not yet tried |
 | Snap tap (SOCD): on/off, up to 20 pairs with 4 modes | Done. Read verified; no-op writes verified; a real change via the GUI not yet tried |
 | Backup and restore of all settings (Settings page; 9 sections) | Done. Probe round trip passed (everything written back, read again, identical). Save and Restore clicked in the real app: restored, the safety backup written first, keyboard identical afterwards |
-| Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
+| Calibration (guided, all keys) | Done. **Run for real by Gert 2026-11-24**: all 61 keys reported done in 28 s, the keyboard announced Finished by itself, Stop was accepted, settings identical before/after (profile compare), still reports calibrated. Calibration data can't be read or backed up, so nothing is undoable except calibrating again |
+| Live travel test (Key test page: one-key depth readout, actuation marker, keyboard drawing) | Done. **Probe session with all 61 keys passed, and Gert used the app's Key test page on the real keyboard 2026-11-24: works well** (see Protocol essentials). Page and worker session checked with a simulated run (`FIZZ_KEYTEST_DEMO=1`, both themes). The start packet is still on the blocked list; only `Keyboard::start_travel_test` bypasses it. |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
 | Hot-plug reconnect / unplug detection | Built; unplug detection untested |
@@ -254,16 +284,20 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 ## Roadmap (in order)
 
 1. ~~Actuation and rapid trigger~~ done 2026-11-24. Follow-ups, in order:
-   - **Live travel test**: blocked after a 61-key start reset the keyboard. One key is stable,
+   - **Live travel test** (Gert, 2026-11-24: in the vendor app it shows only the key being pressed and
+     its depth, one key at a time, jumping between keys; the vendor code nevertheless requests all keys
+     in the bitmap, same as our first attempt, so the vendor must do something we don't (heartbeat `0x01`
+     during the test? reading fast? a different order) or our reset had another cause. UI should be a
+     single "key being pressed" readout. Alternative to investigate: the `0x23` ADC stream.)
+     Blocked after a 61-key start reset the keyboard. One key is stable,
      including while pressed (0–340 steps). Next, each with Gert's OK and a non-Esc key: a small
      bitmap (e.g. 5 keys), then larger ones, to find what's safe; maybe the vendor's `0x01`
      heartbeat matters for the full set. If only small sets are safe, the UI can test the
      selected keys only. The worker must stream input (no `drain()`/heartbeat while testing) and
      always send `[5]=3` on stop, page change and shutdown. If it works: show a live
      bar per key on the drawing.
-   - **Calibration**: `[5]=8 [6]=0/1` start/stop all keys, `[5]=7 row col` one key, `[5]=0x0F/0x10`
-     "any key"; progress arrives as `0x21 [5]=7/8/0x0F` with `[6]` 0 success, 1 progress (bitmap at
-     `[7..0x1D]`), 2/4 failed. Treat as behaviour-changing: ask Gert first.
+   - ~~Calibration~~ done 2026-11-24: built and run for real with Gert (see Status and Protocol
+     essentials). Rule stays: never start a calibration without Gert at the keyboard.
    - Reset to defaults `[5]=6` (unknown defaults; ask first). Presets/quick buttons (e.g. "Gaming 0.4 mm").
 2. ~~Polling rate setting~~ done 2026-11-24.
 3. ~~Per-key RGB~~ done 2026-11-24 (edits the active colour layer only). Possible follow-ups:
@@ -281,8 +315,14 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
    with `arg1` = macro index. Needs a recorder UI.
 6. ~~Export/import of all settings~~ done 2026-11-24 (Settings page; also restores files made by
    the probe's `--profile-export`). Possible follow-ups: import from any path with a file dialog,
-   delete saved files, restore only chosen sections. Then: calibration (ask first); dead zones and
-   advanced keys only after a test proves the firmware uses them. Skip: profiles (no
+   delete saved files, restore only chosen sections. Dead zones dropped (Gert doesn't remember them in
+   the vendor app and the status flag is off); advanced keys: Gert's screenshot of the vendor app's Advanced Keys page (2026-11-24) shows it
+   offers only Dynamic Key Stroke (DKS, 1-4 functions at 4 press depths), Tap/Hold (MT), Toggle (TGL)
+   and SOCD, so rapid snap, RKRT, MDS and dead zones don't exist for this keyboard. DKS, MT and TGL are
+   possible later features (read `0x22 80`, 40 slots, all empty now; the keyboard's status flags for
+   them are off, so prove with a read-only test first). The vendor sidebar: Key Settings, Advanced
+   Keys, Light Settings, Trigger Settings, Switch Calibration, Other Settings, Theme Settings,
+   Profile Settings (a "Default Profile", probably stored in the browser), Factory Reset (not built). Skip: profiles (no
    reply), locks (flag off), switch types (one type), sleep timer (blocked command).
 7. Release (after the features, per Gert): app icon, single `.exe`, GitHub Actions building Windows + Linux binaries; run on Linux once.
 

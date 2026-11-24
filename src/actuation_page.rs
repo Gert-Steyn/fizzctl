@@ -135,6 +135,7 @@ impl ActuationPage {
                         unsaved: false,
                         tooltip: format!("{}: no reply from the keyboard", key.label),
                         swatch: None,
+                    done: false,
                     };
                 };
                 let f = Fields::from(t);
@@ -156,6 +157,7 @@ impl ActuationPage {
                     unsaved: changed.contains(&key.slot),
                     tooltip,
                     swatch: None,
+                    done: false,
                 }
             },
         );

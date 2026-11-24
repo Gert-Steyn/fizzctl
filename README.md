@@ -44,7 +44,7 @@ cargo run --bin fizz-probe -- --profile-roundtrip
 | Macros: 10 macros of key presses and clicks with delays, 4 play modes, assigned to keys via Key mapping; record steps by typing | Read and write |
 | Backup and restore of every setting to a file, with an automatic safety backup before a restore | Yes |
 | Packet log of all traffic | Yes |
-| Calibration | Not built yet |
+| Switch calibration: guided run with live green keys | Yes |
 | Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
 
 ### Actuation
@@ -55,6 +55,16 @@ point, rapid trigger, and its sensitivity (one value, or separate press and
 release). Only the settings you change are applied to the selected keys.
 **Save actuation** sends one packet per distinct setting and reads every
 changed key back to check it.
+
+### Calibration
+
+The Calibration page guides a full switch calibration: choose **Start
+calibration** (after a confirmation), press each key all the way down and hold
+it until it turns green on the drawing, repeat 2 or 3 times, then choose **Stop
+calibration**. The keyboard can't report its calibration back, so it can't be
+backed up; if a run goes wrong, calibrate again. Leaving the page, closing the
+app or unplugging the keyboard always ends calibration. A log of the keyboard's
+messages is saved in the app's data folder.
 
 ### Backup and restore
 
@@ -124,7 +134,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Developer overrides
 
-`FIZZ_PAGE` (`keys`, `actuation`, `socd`, `macros`, `lighting`, `packets`, `settings`),
+`FIZZ_PAGE` (`keys`, `actuation`, `calibration`, `socd`, `macros`, `lighting`, `packets`, `settings`),
 `FIZZ_RECORD=1` (start recording into macro 1) picks the start page,
 `FIZZ_THEME` (`dark`, `light`) forces a theme without saving it, and on the
 key mapping and actuation pages `FIZZ_KEY` (a slot number, e.g. `66` for Caps)

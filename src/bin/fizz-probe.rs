@@ -10,6 +10,7 @@
 //! cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1
 //! cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked
 //! cargo run --bin fizz-probe -- --travel-stop
+//! cargo run --bin fizz-probe -- --travel-session 15   # vendor-style: all keys, 1 s heartbeat
 //! cargo run --bin fizz-probe -- --rewrite-socd
 //! cargo run --bin fizz-probe -- --read-macros
 //! cargo run --bin fizz-probe -- --macro-write-test
@@ -150,6 +151,9 @@ fn main() {
     if std::env::args().any(|a| a == "--survey") {
         survey(&mut kb);
         std::process::exit(0);
+    }
+    if let Some(secs) = arg_after("--travel-session").and_then(|a| a.parse::<f32>().ok()) {
+        std::process::exit(if travel_session(&mut kb, secs) { 0 } else { 2 });
     }
     if std::env::args().any(|a| a == "--travel-stop") {
         // Safe cleanup if a travel test was interrupted before its stop.
@@ -1255,4 +1259,84 @@ fn profile_roundtrip(kb: &mut Keyboard) -> bool {
     let ok = applied && diff.is_empty();
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+/// The vendor app's live key test, copied from a capture of it: read the
+/// actuation settings, ask for the travel of every key, send a status request
+/// every second, read the stream continuously, stop at the end.
+fn travel_session(kb: &mut Keyboard, secs: f32) -> bool {
+    use std::time::Instant;
+    kb.on_packet = None;
+    let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
+    let high_precision = kb
+        .read_status()
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.support.high_precision);
+    let config = kb.read_trigger_config(high_precision).ok().flatten();
+    let triggers = kb.read_key_triggers(&slots).unwrap_or_default();
+    println!(
+        "\nBefore the test: actuation config {config:?}, {} of {} keys answered",
+        triggers.iter().flatten().count(),
+        slots.len()
+    );
+    let unit_mm = config.map_or(0.01, |c| c.unit_mm);
+
+    println!("Starting the all-keys travel test for {secs} s: press keys now");
+    if let Err(e) = kb.start_travel_test(&slots) {
+        println!("  start failed: {e}");
+        return false;
+    }
+
+    let started = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let mut reports = 0usize;
+    let mut per_second = std::collections::BTreeMap::<u64, usize>::new();
+    let mut per_key = std::collections::BTreeMap::<usize, (usize, u16)>::new();
+    let mut error = None;
+    while started.elapsed().as_secs_f32() < secs {
+        if last_heartbeat.elapsed() >= fizz::device::HEARTBEAT {
+            if let Err(e) = kb.heartbeat() {
+                error = Some(e.to_string());
+                break;
+            }
+            last_heartbeat = Instant::now();
+        }
+        match kb.poll_travel() {
+            Ok(batch) => {
+                for (slot, travel) in batch {
+                    reports += 1;
+                    *per_second.entry(started.elapsed().as_secs()).or_default() += 1;
+                    let e = per_key.entry(slot).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.max(travel);
+                }
+            }
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Always stop, whatever happened above.
+    let stopped = kb.stop_travel_test();
+    std::thread::sleep(Duration::from_millis(100));
+    let alive = kb.drain().is_ok() && kb.request_same("status", &p::status_request(), TIMEOUT).is_ok();
+    println!("\nstop sent: {}", if stopped.is_ok() { "yes" } else { "FAILED" });
+    if let Some(e) = &error {
+        println!("stream error: {e}");
+    }
+    println!("travel reports: {reports}, keys seen: {}", per_key.len());
+    println!("reports per second: {per_second:?}");
+    for (slot, (n, max)) in &per_key {
+        let label = fizz::keymap::LAYOUT
+            .iter()
+            .find(|k| k.slot == *slot)
+            .map_or("?", |k| k.label);
+        println!("  {label:>8} (slot {slot:3}): {n:4} reports, deepest {:.2} mm", *max as f32 * unit_mm);
+    }
+    println!("keyboard answers after stop: {alive}");
+    error.is_none() && stopped.is_ok() && alive
 }

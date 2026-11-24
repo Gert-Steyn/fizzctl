@@ -101,6 +101,9 @@ pub struct ColourWrite {
 /// Pause between trigger write packets, which the keyboard doesn't acknowledge.
 const TRIGGER_WRITE_GAP: Duration = Duration::from_millis(30);
 
+/// How often the vendor app sends a status request while it is connected.
+pub const HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// Result of [`Keyboard::write_key_triggers`].
 #[derive(Clone, Debug)]
 pub struct TriggerWrite {
@@ -440,6 +443,48 @@ impl Keyboard {
             }
         }
         self.read_macro_raw(slot)
+    }
+
+    // -- Live key-travel stream -------------------------------------------
+    //
+    // Sequence taken from a capture of the vendor app's own live key test
+    // (2026-11-24): it sends this same start message, then a status request
+    // ("heartbeat") every second while reading the stream, and a stop at the
+    // end. The status requests must not drain the input queue, or they would
+    // swallow travel reports.
+
+    /// Ask the keyboard to stream the travel of every key in `slots`.
+    ///
+    /// The start message is on the blocked list because the first attempt to
+    /// use it reset the keyboard. This is the one place that sends it, so a
+    /// caller opts in on purpose; everything else about the session is
+    /// documented above.
+    pub fn start_travel_test(&mut self, slots: &[usize]) -> Result<()> {
+        self.drain()?;
+        self.send_raw(&protocol::travel_test_start(slots))
+    }
+
+    /// Send the status request the vendor app sends every second. The reply
+    /// arrives in the stream and is ignored by [`Keyboard::poll_travel`].
+    pub fn heartbeat(&mut self) -> Result<()> {
+        self.send(&protocol::status_request())
+    }
+
+    /// Read what the keyboard has sent so far and return its travel reports
+    /// as `(key slot, depth in steps)`, oldest first. Other packets are dropped.
+    pub fn poll_travel(&mut self) -> Result<Vec<(usize, u16)>> {
+        let mut out = Vec::new();
+        while let Some(packet) = self.recv(Duration::ZERO)? {
+            if let Some(report) = protocol::parse_travel(&packet) {
+                out.push(report);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stop the stream. Safe to send at any time.
+    pub fn stop_travel_test(&mut self) -> Result<()> {
+        self.send(&protocol::travel_test_stop())
     }
 
     /// The status reply: feature flags and the like.

@@ -21,6 +21,8 @@ pub struct KeyFace {
     pub unsaved: bool,
     /// A colour bar along the bottom of the keycap (per-key lighting).
     pub swatch: Option<[u8; 3]>,
+    /// Drawn in the success colours (a key that has been calibrated).
+    pub done: bool,
     pub tooltip: String,
 }
 
@@ -66,14 +68,18 @@ pub fn keyboard_view(
 
         let selected = is_selected(key.slot);
         let face = face(key);
-        let fill = if selected {
+        let fill = if face.done {
+            p.success_subtle
+        } else if selected {
             p.accent_subtle
         } else if response.hovered() {
             p.hover
         } else {
             p.surface
         };
-        let stroke = if selected || response.has_focus() {
+        let stroke = if face.done {
+            Stroke::new(size::BORDER, p.success)
+        } else if selected || response.has_focus() {
             Stroke::new(size::BORDER, p.accent)
         } else if response.hovered() {
             Stroke::new(size::BORDER, p.border_strong)
@@ -131,4 +137,26 @@ pub fn keyboard_view(
             .on_hover_text(face.tooltip);
     }
     clicked
+}
+
+/// Keep keyboard focus on an invisible widget and tell egui it wants Tab, the
+/// arrows and Esc. While this runs, pressing keys can't move focus around the
+/// window or click the button that was last used (Space and Enter would).
+/// Call it every frame for as long as keys are being captured.
+pub fn capture_keys(ui: &mut Ui, id_salt: &str) {
+    let id = ui.make_persistent_id(id_salt);
+    let rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::splat(size::BORDER));
+    ui.interact(rect, id, Sense::focusable_noninteractive());
+    ui.memory_mut(|m| {
+        m.request_focus(id);
+        m.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                tab: true,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: true,
+            },
+        );
+    });
 }

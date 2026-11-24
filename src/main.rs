@@ -3,7 +3,9 @@
 mod actuation_page;
 mod app;
 mod backup;
+mod calibration_page;
 mod capture;
+mod key_test_page;
 mod keyboard_view;
 mod keymap_page;
 mod macros_page;

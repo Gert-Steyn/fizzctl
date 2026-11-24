@@ -16,6 +16,7 @@ use fizz::recorder::{DEFAULT_DELAY_MS, MAX_DELAY_MS, Recorder, Timing, is_balanc
 
 use crate::capture;
 use crate::graphite::{self, Tone, Type, size, space};
+use crate::keyboard_view::capture_keys;
 use crate::worker::{Request, Snapshot};
 
 const MOUSE_BUTTONS: [(u8, &str); 5] = [
@@ -203,30 +204,6 @@ impl MacrosPage {
         }
     }
 
-    /// Keep keyboard focus on an invisible recorder widget while recording,
-    /// and tell egui it wants Tab, the arrows and Esc, so those keys are
-    /// recorded instead of moving focus around the window.
-    fn keep_focus(&self, ui: &mut Ui) {
-        if self.recording.is_none() {
-            return;
-        }
-        let id = ui.make_persistent_id("macro-recorder");
-        let rect = egui::Rect::from_min_size(ui.cursor().min, egui::Vec2::splat(size::BORDER));
-        ui.interact(rect, id, egui::Sense::focusable_noninteractive());
-        ui.memory_mut(|m| {
-            m.request_focus(id);
-            m.set_focus_lock_filter(
-                id,
-                egui::EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: true,
-                },
-            );
-        });
-    }
-
     pub fn show(&mut self, ui: &mut Ui, tx: &Sender<Request>) {
         let Some(mut macros) = self.edit.clone() else {
             graphite::empty_state(
@@ -241,7 +218,9 @@ impl MacrosPage {
         };
         let now_ms = ui.input(|i| i.time) * 1000.0;
         self.capture(ui, &mut macros, now_ms);
-        self.keep_focus(ui);
+        if self.recording.is_some() {
+            capture_keys(ui, "macro-recorder");
+        }
 
         let p = graphite::palette(ui);
         let recording = self.recording.is_some();

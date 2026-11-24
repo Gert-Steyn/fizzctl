@@ -246,6 +246,7 @@ impl KeymapPage {
                     unsaved: stored.is_some_and(|s| s[key.slot] != action),
                     tooltip: format!("{}: {}", key.label, describe_in(layer, action)),
                     swatch: None,
+                    done: false,
                 }
             },
         )

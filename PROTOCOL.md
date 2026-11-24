@@ -176,7 +176,16 @@ After writing key maps, poll `0x01` until the "storing" bit (`s[17]` bit 1, i.e.
   `21 00 00 00 01 00`, accepted stop, and stayed connected. With only Right Ctrl and the key being
   pressed for 20 s it streamed 416 reports covering travel 0–340 steps (the full 3.40 mm) and stayed
   connected. So the stream is fine; the reset is most likely caused by the 61-key bitmap.
-* Not built yet: `[5]=6` reset, calibration `[5]=7/8/0x0F/0x10` (pushes progress as `0x21 [5]=7/8/0x0F`).
+* **Calibration**, confirmed on the real keyboard (2026-11-24, Gert's run): start `0x21 [4]=0x18 [5]=8
+  [6]=0`, stop `[6]=1`. The keyboard answers the start within ~30 ms with an empty progress message,
+  then pushes `0x21 [5]=8` messages: `[6]=1` **progress** with a 22-byte column bitmap at `[7..29]`
+  (bit n of byte c = row n, column c; **cumulative**, every message lists all keys done so far) each
+  time a key completes, then `[6]=0` **finished** on its own once all 61 keys are done (carrying the
+  final bitmap), 28 s after the start in that run. `[6]=2` or `4` would be a failure (not seen). The
+  stop sent after Finished was accepted and the keyboard kept answering. `[5]=7 row col` calibrates one
+  key and `[5]=0x0F`/`0x10` start/stop "any key" calibration with the same message layout; neither is
+  used. The calibration data itself cannot be read back, so it cannot be backed up.
+* Not built yet: `[5]=6` reset (factory values unknown).
 
 ## Per-key colours (`0x09`), confirmed on the real keyboard
 

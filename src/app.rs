@@ -84,6 +84,8 @@ pub struct FizzApp {
     keymap: KeymapPage,
     actuation: ActuationPage,
     applying: bool,
+    /// Polling rate being set, while waiting for the keyboard to confirm.
+    setting_poll_rate: Option<u32>,
     notice: Option<(Notice, Instant)>,
     log: VecDeque<LogEntry>,
     started: Instant,
@@ -132,6 +134,7 @@ impl FizzApp {
             keymap,
             actuation,
             applying: false,
+            setting_poll_rate: None,
             notice: None,
             log: VecDeque::new(),
             started: Instant::now(),
@@ -193,7 +196,19 @@ impl FizzApp {
                     self.actuation.on_saved(stored);
                     self.notify(Notice::Success("Actuation saved to the keyboard.".into()));
                 }
+                Update::PollRateSet(stored) => {
+                    if let Some(s) = self.snapshot.as_mut() {
+                        s.poll_rate_hz = stored;
+                    }
+                    if let (Some(wanted), Some(got)) = (self.setting_poll_rate, stored)
+                        && wanted == got
+                    {
+                        self.notify(Notice::Success(format!("Polling rate set to {got} Hz.")));
+                    }
+                    self.setting_poll_rate = None;
+                }
                 Update::Error(message) => {
+                    self.setting_poll_rate = None;
                     self.applying = false;
                     self.keymap.on_error();
                     self.actuation.on_error();
@@ -374,13 +389,35 @@ impl FizzApp {
         ui.add_space(space::S6);
         section_heading(ui, "Performance");
         graphite::card(ui, |ui| {
-            let rate = snap
-                .poll_rate_hz
-                .map(|hz| format!("{hz} Hz"))
-                .unwrap_or_else(unknown);
-            graphite::setting_row(ui, "Polling rate", None, |ui| {
-                ui.label(graphite::value_text(ui, rate, false));
-            });
+            let supported = snap.status.as_ref().is_some_and(|s| s.support.poll_rate);
+            match (snap.poll_rate_hz, supported) {
+                (Some(current), true) => {
+                    let mut choice = self.setting_poll_rate.unwrap_or(current);
+                    graphite::setting_row(
+                        ui,
+                        "Polling rate",
+                        Some("How often the keyboard reports to the PC. Higher is faster but uses a little more CPU."),
+                        |ui| {
+                            if self.setting_poll_rate.is_some() {
+                                ui.add(egui::Spinner::new().size(size::ICON));
+                            }
+                            let options = [(1000, "1 kHz"), (2000, "2 kHz"), (4000, "4 kHz"), (8000, "8 kHz")];
+                            if graphite::segmented(ui, &mut choice, &options)
+                                && self.setting_poll_rate.is_none()
+                            {
+                                self.setting_poll_rate = Some(choice);
+                                let _ = self.worker.tx.send(Request::SetPollRate(choice));
+                            }
+                        },
+                    );
+                }
+                (rate, _) => {
+                    let rate = rate.map(|hz| format!("{hz} Hz")).unwrap_or_else(unknown);
+                    graphite::setting_row(ui, "Polling rate", None, |ui| {
+                        ui.label(graphite::value_text(ui, rate, false));
+                    });
+                }
+            }
             graphite::divider(ui);
             let calibrated = snap.status.as_ref().map(|s| s.support.calibrated);
             graphite::setting_row(ui, "Switch calibration", None, |ui| {

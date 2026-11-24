@@ -25,11 +25,17 @@ pub mod cmd {
     pub const SERIAL: u8 = 0x15;
     pub const PROFILE_TRIGGER: u8 = 0x21;
 
-    /// Commands this app must never send: `0x0B` enters the firmware
-    /// bootloader, and `0x14` with sub-command `0x02` is built identically for
-    /// both "factory reset" and "read sleep timer" in the vendor app.
+    /// Commands this app must never send:
+    /// - `0x0B` enters the firmware bootloader;
+    /// - `0x14 02` is built identically for "factory reset" and "read sleep
+    ///   timer" in the vendor app;
+    /// - `0x21 .. 18 02` starts the live travel test, which made the keyboard
+    ///   drop off USB and reset on 2026-11-24 (firmware 3.17.01). Unblock only
+    ///   for a deliberate, agreed retry.
     pub const fn is_blocked(packet: &super::Packet) -> bool {
-        packet[0] == 0x0B || (packet[0] == 0x14 && packet[1] == 0x02)
+        packet[0] == 0x0B
+            || (packet[0] == 0x14 && packet[1] == 0x02)
+            || (packet[0] == PROFILE_TRIGGER && packet[4] == 0x18 && packet[5] == 0x02)
     }
 }
 
@@ -276,6 +282,26 @@ pub fn parse_serial(reply: &Packet) -> Option<String> {
 }
 
 /// Polling rate in Hz, from the reply to [`poll_rate_request`].
+/// Polling rates the keyboard accepts, in Hz.
+pub const POLL_RATES_HZ: [u32; 4] = [1000, 2000, 4000, 8000];
+
+/// Set the polling rate. The keyboard doesn't reply; read it back with
+/// [`poll_rate_request`]. Returns `None` for an unsupported rate.
+pub fn poll_rate_write(hz: u32) -> Option<Packet> {
+    let code = match hz {
+        1000 => 1,
+        2000 => 2,
+        4000 => 4,
+        8000 => 8,
+        _ => return None,
+    };
+    let mut p = packet(cmd::PROFILE_TRIGGER);
+    p[5] = 0x09;
+    p[6] = 0x01;
+    p[7] = code;
+    Some(p)
+}
+
 pub fn parse_poll_rate(reply: &Packet) -> Option<u32> {
     if reply[0] != cmd::PROFILE_TRIGGER || reply[5] != 0x09 {
         return None;
@@ -655,6 +681,35 @@ pub fn key_trigger_write(trigger: &KeyTrigger, slots: &[usize]) -> Packet {
     p
 }
 
+/// Start the live travel test for `slots`: the keyboard then streams
+/// [`parse_travel`] packets while keys move. Stop it with [`travel_test_stop`].
+pub fn travel_test_start(slots: &[usize]) -> Packet {
+    let mut p = trigger_packet(0x02);
+    for &slot in slots {
+        let (row, col) = (slot / TRIGGER_COLS, slot % TRIGGER_COLS);
+        if row < 8 {
+            p[6 + col] |= 1 << row;
+        }
+    }
+    p
+}
+
+pub fn travel_test_stop() -> Packet {
+    trigger_packet(0x03)
+}
+
+/// A pushed travel report during the live test: `(slot, travel in steps)`.
+pub fn parse_travel(packet: &Packet) -> Option<(usize, u16)> {
+    if packet[0] != cmd::PROFILE_TRIGGER || packet[5] != 0x01 {
+        return None;
+    }
+    let (row, col) = (packet[6] as usize, packet[7] as usize);
+    if col >= TRIGGER_COLS {
+        return None;
+    }
+    Some((row * TRIGGER_COLS + col, u16::from_le_bytes([packet[8], packet[9]])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,9 +816,32 @@ mod tests {
     }
 
     #[test]
+    fn poll_rate_write_matches_vendor_layout() {
+        let p = poll_rate_write(8000).unwrap();
+        assert_eq!(&p[..8], &[0x21, 0, 0, 0, 0, 0x09, 0x01, 0x08]);
+        assert!(poll_rate_write(500).is_none());
+        // The read reply format the keyboard sent: [6] = rate code.
+        let reply = reply(&[0x21, 0, 0, 0, 0x02, 0x09, 0x08]);
+        assert_eq!(parse_poll_rate(&reply), Some(8000));
+    }
+
+    #[test]
+    fn travel_test_packets() {
+        let start = travel_test_start(&[22, 120]);
+        assert_eq!(&start[..6], &[0x21, 0, 0, 0, 0x18, 0x02]);
+        assert_eq!((start[6], start[16]), (1 << 1, 1 << 5));
+        assert_eq!(&travel_test_stop()[..6], &[0x21, 0, 0, 0, 0x18, 0x03]);
+        let push = reply(&[0x21, 0, 0, 0, 0x04, 0x01, 5, 10, 0x2C, 0x01]);
+        assert_eq!(parse_travel(&push), Some((120, 300)));
+    }
+
+    #[test]
     fn dangerous_commands_are_blocked() {
         assert!(cmd::is_blocked(&reply(&[0x0B])));
         assert!(cmd::is_blocked(&reply(&[0x14, 0x02])));
+        assert!(cmd::is_blocked(&travel_test_start(&[22])));
+        assert!(!cmd::is_blocked(&travel_test_stop()));
+        assert!(!cmd::is_blocked(&key_trigger_write(&KeyTrigger::default(), &[22])));
         assert!(!cmd::is_blocked(&status_request()));
         assert!(!cmd::is_blocked(&light_config_request(Zone::Keys)));
     }

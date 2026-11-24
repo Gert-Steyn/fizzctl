@@ -17,13 +17,14 @@ Read-only connection test that prints every packet:
 cargo run --bin fizz-probe
 ```
 
-Test the save paths without changing anything. Each command backs up what the
-keyboard holds to `backups/`, writes it back unchanged and checks the keyboard
-still holds the same values (key map, then actuation):
+Test the save paths without changing anything. Each command writes what the
+keyboard holds back unchanged and checks it still holds the same values (key
+map, actuation, polling rate). The first two also save a backup to `backups/`:
 
 ```powershell
 cargo run --bin fizz-probe -- --rewrite-keymap
 cargo run --bin fizz-probe -- --rewrite-triggers
+cargo run --bin fizz-probe -- --rewrite-poll-rate
 ```
 
 ## What works
@@ -31,12 +32,14 @@ cargo run --bin fizz-probe -- --rewrite-triggers
 | Area | Status |
 |---|---|
 | Device info: name, firmware, build date, product code, serial | Read |
-| Polling rate, calibration state, supported features | Read |
+| Polling rate (1/2/4/8 kHz) | Read and write |
+| Calibration state, supported features | Read |
 | Key lighting: effect, brightness, speed, rainbow, colours, direction | Read and write |
 | Key mapping, default and Fn layers: keys, media, mouse, shortcuts, lighting controls | Read and write |
 | Actuation point and rapid trigger, per key or many keys at once | Read and write |
 | Packet log of all traffic | Yes |
-| Macros, per-key RGB, live travel test, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
+| Macros, per-key RGB, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
+| Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
 
 ### Actuation
 
@@ -73,8 +76,9 @@ only key lighting is shown.
 
 ## Safety
 
-`device::Keyboard::send` refuses two commands outright: `0x0B` (enter
-firmware bootloader) and `0x14 02`. The vendor app builds the same `0x14 02`
+`device::Keyboard::send` refuses three commands outright: `0x0B` (enter
+firmware bootloader), `0x14 02`, and the live travel test start, which made the
+keyboard reset. The vendor app builds the same `0x14 02`
 bytes for both "factory reset" and "read sleep timer", so it's blocked until
 we know which it does.
 

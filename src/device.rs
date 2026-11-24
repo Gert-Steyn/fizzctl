@@ -152,6 +152,18 @@ impl Keyboard {
         if protocol::cmd::is_blocked(packet) {
             return Err(Error::Blocked);
         }
+        self.send_raw(packet)
+    }
+
+    /// Send a packet even if it's on the blocked list. Only for one-off
+    /// experiments Gert has agreed to, run from `fizz-probe` with
+    /// `--allow-blocked`. The app must never call this.
+    pub fn send_overriding_block(&mut self, packet: &Packet) -> Result<()> {
+        self.drain()?;
+        self.send_raw(packet)
+    }
+
+    fn send_raw(&mut self, packet: &Packet) -> Result<()> {
         let mut buf = [0u8; PACKET_LEN + 1];
         buf[0] = REPORT_ID;
         buf[1..].copy_from_slice(packet);

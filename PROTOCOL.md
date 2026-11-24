@@ -167,8 +167,19 @@ After writing key maps, poll `0x01` until the "storing" bit (`s[17]` bit 1, i.e.
   settings back unchanged (`fizz-probe --rewrite-triggers`): one packet, all 61 keys read back identical.
 * **Modes**: `0x00` fixed actuation; `0x0C` rapid trigger with one sensitivity (vendor app sets
   release = press); `0x0D` rapid trigger with separate press/release; `0x01` older rapid trigger.
-* Not built yet: `[5]=6` reset, `[5]=2/3` live travel test (pushes `0x21 [5]=1` row, col, travel),
-  calibration `[5]=7/8/0x0F/0x10` (pushes progress as `0x21 [5]=7/8/0x0F`).
+* **Live travel test**: `[5]=2` + 22-byte key bitmap at `[6]` starts, `[5]=3` stops. The keyboard
+  pushes `21 00 00 00 03 01 row col travel_lo travel_hi`. **Warning:** on firmware 3.17.01, starting
+  it for all 61 keys made the keyboard drop off USB within a few reports (Windows: "surprise
+  removed… missing on the bus"); it reconnected by itself with settings intact. The app refuses to
+  send this command.
+  A retry with only Esc in the bitmap (keys idle, 3 s) was stable: the keyboard acked the start with
+  `21 00 00 00 01 00`, accepted stop, and stayed connected.
+* Not built yet: `[5]=6` reset, calibration `[5]=7/8/0x0F/0x10` (pushes progress as `0x21 [5]=7/8/0x0F`).
+
+## Polling rate
+
+* Read `0x21 [4]=1 [5]=9` → reply `[6]` = 1/2/4/8 (1–8 kHz). Write `0x21 [5]=9 [6]=1 [7]=code`, no reply.
+  Writing the current rate back was verified on 2026-11-24.
 
 ## Safe first tests
 

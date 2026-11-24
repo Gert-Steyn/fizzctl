@@ -778,9 +778,10 @@ pub fn setting_row(
     Frame::new()
         .inner_margin(Margin::symmetric(0, 6))
         .show(ui, |ui| {
-            // `Sides` centres the label block against the control and sizes
+            // `Sides` centres the label block against the control, wraps a long
+            // description instead of widening the row, and sizes
             // the row to the taller of the two.
-            egui::Sides::new().height(size::ROW).show(
+            egui::Sides::new().height(size::ROW).shrink_left().wrap().show(
                 ui,
                 |ui| match description {
                     // A lone label is centred by `Sides`; a `vertical` block

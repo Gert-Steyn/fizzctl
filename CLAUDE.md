@@ -30,6 +30,8 @@ cargo run --release                          # the app
 cargo run --bin fizz-probe                   # read-only diagnostics, prints every packet
 cargo run --bin fizz-probe -- --rewrite-keymap   # backs up both layers, writes them back unchanged, verifies
 cargo run --bin fizz-probe -- --rewrite-triggers # same for every key's actuation settings
+cargo run --bin fizz-probe -- --rewrite-poll-rate # writes the current polling rate back, verifies
+cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked  # live travel test on one key; only for agreed experiments
 cargo test                                   # unit tests (protocol + keymap)
 cargo clippy --all-targets                   # 1 expected warning, in src/graphite.rs (see below)
 ```
@@ -63,9 +65,11 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 ## Rules
 
 ### Safety with the real keyboard
-- **Never send** `0x0B` (enters the firmware bootloader) or `0x14 02` (the vendor app builds the
-  same bytes for "factory reset" and "read sleep timer"). `protocol::cmd::is_blocked` enforces this
-  in `Keyboard::send`; keep it that way and add any newly found dangerous commands there.
+- **Never send** `0x0B` (enters the firmware bootloader), `0x14 02` (the vendor app builds the
+  same bytes for "factory reset" and "read sleep timer"), or `0x21 .. 18 02` (starts the live travel
+  test, which **made the keyboard drop off USB and reset** on 2026-11-24, see below).
+  `protocol::cmd::is_blocked` enforces this in `Keyboard::send`; keep it that way and add any newly
+  found dangerous commands there. Unblock something only for a retry Gert has agreed to.
 - New command → try it **read-only first** via `fizz-probe`, then decode, then write.
 - Before testing a write path on the real keyboard: back up what it holds, then do a **no-op write**
   (write back exactly what was read) and verify with a read-back, like `--rewrite-keymap`. Ask Gert
@@ -79,6 +83,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   spacing literals in screen code (`app.rs`, `keymap_page.rs`). Check with
   `grep -nE 'Color32::from|from_rgb|add_space\([0-9]|\.size\([0-9]|CornerRadius::same|Margin::' src/app.rs src/keymap_page.rs`.
 - One primary (accent) button per view. Sentence case, verb-first buttons. Lucide icons only.
+- `setting_row` uses `Sides::shrink_left().wrap()`: the control is laid out first and a long
+  description wraps instead of widening the card (a long one used to push cards off-screen).
 - New reusable components go in `src/graphite.rs`, not in screens. Added so far (candidates to fold
   back into the skill, tell Gert): `segmented`, `setting_row`, `value_text`, `banner`.
 - The one clippy warning (`field_reassign_with_default`) is in the skill's own `graphite.rs`; leave it
@@ -132,6 +138,19 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   `t t p r` high bytes at `[28..36]`. One packet sets any number of keys; no ack, so read back.
   Modes: `0` fixed, `0x0C` RT single sensitivity (release = press), `0x0D` RT split, `0x01` legacy RT.
   **No-op write verified 2026-11-24** (1 packet for all 61 keys, read-back identical).
+- Polling rate write `0x21 [5]=9 [6]=1 [7]=1|2|4|8` (no reply; read back). No-op write verified
+  2026-11-24 (8000 → 8000).
+- **Live travel test incident (2026-11-24):** `0x21 [4]=0x18 [5]=2` + all 61 keys in the bitmap
+  (byte-identical to the vendor app's `openTriggerTest`) made the keyboard stream ~5 reports
+  (`21 00 00 00 03 01 row col lo hi`, idle keys at 0–16 steps), then **drop off USB**: Windows logged
+  "surprise removed as it is reported as missing on the bus" (Kernel-PnP 1010). It re-enumerated by
+  itself; all settings were intact afterwards (checked read-only). Stop (`[5]=3`) could not be sent.
+  Not yet known whether it's the full bitmap, a missing host heartbeat, or a firmware bug.
+- **One-key retry (2026-11-24, agreed with Gert):** Esc only, 3 s, keys idle. The keyboard acked the
+  start (`21 00 00 00 01 00`), sent no travel reports, accepted stop, kept answering, and Windows
+  logged no removal. So a single-key test is stable *while idle*; the first run's reset came either
+  from the full bitmap or from the report stream itself. Next step needs Esc pressed during a test:
+  `fizz-probe --travel-test 10 --key 22 --allow-blocked` (Gert runs it and presses Esc).
 - Vendor app sources: `https://www.illumipc.com/app.js` (`WMJ1` + XOR `witmod-app-0x5a`);
   configs under `/config/` (`WMX1:` base64 XOR `witmod-config-0x5a`). Layout file for this board:
   `config/keys/7153USHEXYXACPARGB.json`.
@@ -147,6 +166,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Key lighting (effect, brightness, speed, rainbow, colours, direction) | Done. Read verified; **write not yet confirmed by Gert on the device** |
 | Key mapping, default + Fn layers | Done. Read verified; write path verified with a no-op write. A real remap via the GUI's Save button not yet tried |
 | Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
+| Polling rate (1/2/4/8 kHz on Overview, applies immediately) | Done. No-op write verified; a real change via the GUI not yet tried |
+| Live travel test | **Blocked**: starting it reset the keyboard (see Protocol essentials) |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
 | Hot-plug reconnect / unplug detection | Built; unplug detection untested |
@@ -155,14 +176,16 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 ## Roadmap (in order)
 
 1. ~~Actuation and rapid trigger~~ done 2026-11-24. Follow-ups, in order:
-   - **Live travel test**: `[5]=2` + 22-byte key bitmap at `[6]` starts it, `[5]=3` stops; the keyboard
-     then pushes `0x21 [5]=1` packets: row `[6]`, col `[7]`, travel `[8]|[9]<<8` (steps). Show a live
-     bar per key on the drawing. Needs the worker to forward unsolicited packets.
+   - **Live travel test**: blocked after it reset the keyboard. One-key idle retry was fine. Next:
+     Gert presses Esc during a one-key test; if stable, try a few keys, then all keys with the `0x01`
+     heartbeat the vendor app sends. Each step needs Gert's OK. If it works: show a live
+     bar per key on the drawing; the worker must stream input (no `drain()`/heartbeat while testing)
+     and always send `[5]=3` on stop, page change and shutdown.
    - **Calibration**: `[5]=8 [6]=0/1` start/stop all keys, `[5]=7 row col` one key, `[5]=0x0F/0x10`
      "any key"; progress arrives as `0x21 [5]=7/8/0x0F` with `[6]` 0 success, 1 progress (bitmap at
      `[7..0x1D]`), 2/4 failed. Treat as behaviour-changing: ask Gert first.
    - Reset to defaults `[5]=6` (unknown defaults; ask first). Presets/quick buttons (e.g. "Gaming 0.4 mm").
-2. **Polling rate setting.** One write (`0x21 [5]=9 [6]=1 [7]=1|2|4|8`), segmented control on Overview.
+2. ~~Polling rate setting~~ done 2026-11-24.
 3. **Per-key RGB.** `0x09`: read `[1]=0x80/0x81` (two layers), write `[1]=layer`, pages 0–7 of
    54 bytes (18 keys × RGB, index = `18*page + i`), ack `[0]=9,[1]=layer`. "Custom" effect = mode 10.
    Paint keys on the keyboard drawing.

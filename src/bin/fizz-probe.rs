@@ -5,12 +5,18 @@
 //! cargo run --bin fizz-probe
 //! cargo run --bin fizz-probe -- --rewrite-keymap
 //! cargo run --bin fizz-probe -- --rewrite-triggers
+//! cargo run --bin fizz-probe -- --rewrite-poll-rate
+//! cargo run --bin fizz-probe -- --travel-test 3 --key 22 --allow-blocked
 //! ```
 //!
 //! `--rewrite-keymap` tests the key-map save path without changing anything:
 //! it backs up both layers to `backups/`, writes each one back unchanged, and
 //! checks that the keyboard still holds exactly the same bytes.
-//! `--rewrite-triggers` does the same for every key's actuation settings.
+//! `--rewrite-triggers` does the same for every key's actuation settings, and
+//! `--rewrite-poll-rate` for the polling rate. `--travel-test <seconds>` runs
+//! the live travel test (all keys, or one with `--key <slot>`), prints what the
+//! keyboard streams, and always stops it. Its start command is blocked because it
+//! reset the keyboard once; `--allow-blocked` overrides that for an agreed retry.
 
 use std::time::Duration;
 
@@ -47,6 +53,28 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--rewrite-triggers") {
         let ok = rewrite_triggers(&mut kb);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--travel-test") {
+        let secs = std::env::args()
+            .nth(pos + 1)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(3.0);
+        let arg_after = |flag: &str| {
+            std::env::args()
+                .position(|a| a == flag)
+                .and_then(|i| std::env::args().nth(i + 1))
+        };
+        let slots: Vec<usize> = match arg_after("--key").and_then(|a| a.parse().ok()) {
+            Some(slot) => vec![slot],
+            None => fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect(),
+        };
+        let allow = std::env::args().any(|a| a == "--allow-blocked");
+        let ok = travel_test(&mut kb, secs, &slots, allow);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--rewrite-poll-rate") {
+        let ok = rewrite_poll_rate(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
     }
     kb.on_packet = Some(Box::new(|dir, packet| {
@@ -372,4 +400,105 @@ fn rewrite_triggers(kb: &mut Keyboard) -> bool {
     };
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
+}
+
+/// Write the current polling rate back unchanged and verify.
+fn rewrite_poll_rate(kb: &mut Keyboard) -> bool {
+    let read = |kb: &mut Keyboard| {
+        kb.request(
+            "polling rate",
+            &p::poll_rate_request(),
+            |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x09,
+            TIMEOUT,
+        )
+        .ok()
+        .and_then(|r| p::parse_poll_rate(&r))
+    };
+    let Some(before) = read(kb) else {
+        println!("\nCouldn't read the polling rate, stopping without writing anything");
+        return false;
+    };
+    println!("\nPolling rate is {before} Hz, writing it back unchanged");
+    let Some(packet) = p::poll_rate_write(before) else {
+        return false;
+    };
+    if let Err(e) = kb.write_only(&packet) {
+        println!("  write failed: {e}");
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let after = read(kb);
+    println!("  read back {after:?} Hz");
+    let ok = after == Some(before);
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Run the live travel test for `secs` seconds and summarise the stream.
+fn travel_test(kb: &mut Keyboard, secs: f32, slots: &[usize], allow_blocked: bool) -> bool {
+    kb.on_packet = None;
+    println!(
+        "\nStarting the travel test on {} key(s) {:?} for {secs} s",
+        slots.len(),
+        &slots[..slots.len().min(4)]
+    );
+    let start = p::travel_test_start(slots);
+    let sent = if allow_blocked {
+        println!("  --allow-blocked: sending the blocked start command on purpose");
+        kb.send_overriding_block(&start)
+    } else {
+        kb.write_only(&start)
+    };
+    if let Err(e) = sent {
+        println!("  start failed: {e}");
+        return false;
+    }
+    let until = std::time::Instant::now() + Duration::from_secs_f32(secs);
+    let mut packets = 0usize;
+    let mut other = 0usize;
+    let mut shown = 0;
+    let mut per_key = std::collections::BTreeMap::<usize, (usize, u16, u16)>::new();
+    while std::time::Instant::now() < until {
+        match kb.recv(Duration::from_millis(50)) {
+            Ok(Some(packet)) => match p::parse_travel(&packet) {
+                Some((slot, travel)) => {
+                    packets += 1;
+                    if shown < 5 {
+                        println!("    << {}", p::hex(&packet[..12]));
+                        shown += 1;
+                    }
+                    let e = per_key.entry(slot).or_insert((0, u16::MAX, 0));
+                    e.0 += 1;
+                    e.1 = e.1.min(travel);
+                    e.2 = e.2.max(travel);
+                }
+                None => {
+                    other += 1;
+                    if other <= 3 {
+                        println!("    other << {}", p::hex(&packet[..12]));
+                    }
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                println!("  read failed: {e}");
+                break;
+            }
+        }
+    }
+    // Always stop, whatever happened above.
+    let stopped = kb.write_only(&p::travel_test_stop());
+    println!("  stop sent: {}", if stopped.is_ok() { "yes" } else { "FAILED" });
+    println!("  travel packets {packets}, other packets {other}, keys seen {}", per_key.len());
+    for (slot, (n, lo, hi)) in &per_key {
+        let label = fizz::keymap::LAYOUT
+            .iter()
+            .find(|k| k.slot == *slot)
+            .map_or("?", |k| k.label);
+        println!("    {label:>7} (slot {slot:3}): {n} reports, travel {lo}..{hi}");
+    }
+    // Confirm the keyboard still answers normal requests after stopping.
+    let alive = kb.request_same("status", &p::status_request(), TIMEOUT).is_ok();
+    println!("  keyboard answers after stop: {alive}");
+    stopped.is_ok() && alive
 }

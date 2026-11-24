@@ -24,6 +24,7 @@ pub enum Request {
     SaveKeymap(Layer, Vec<KeyAction>),
     /// Actuation settings, grouped: each setting with the slots it applies to.
     SaveTriggers(Vec<(KeyTrigger, Vec<usize>)>),
+    SetPollRate(u32),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +55,8 @@ pub enum Update {
     LightApplied(LightConfig),
     KeymapSaved(Layer, Vec<KeyAction>),
     TriggersSaved(Vec<(usize, Option<KeyTrigger>)>),
+    /// The polling rate read back after setting it.
+    PollRateSet(Option<u32>),
     Error(String),
     Packet(LogEntry),
 }
@@ -107,7 +110,12 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
     loop {
         let Some(keyboard) = kb.as_mut() else {
             match rx.recv_timeout(RECONNECT_EVERY) {
-                Ok(Request::ApplyLight(_) | Request::SaveKeymap(..) | Request::SaveTriggers(_)) => {
+                Ok(
+                    Request::ApplyLight(_)
+                    | Request::SaveKeymap(..)
+                    | Request::SaveTriggers(_)
+                    | Request::SetPollRate(_),
+                ) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
                 Ok(Request::Refresh) | Err(RecvTimeoutError::Timeout) => {}
@@ -140,6 +148,7 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
             Ok(Request::ApplyLight(cfg)) => apply_light(keyboard, &cfg, &link),
             Ok(Request::SaveKeymap(layer, keys)) => save_keymap(keyboard, layer, &keys, &link),
             Ok(Request::SaveTriggers(groups)) => save_triggers(keyboard, &groups, &link),
+            Ok(Request::SetPollRate(hz)) => set_poll_rate(keyboard, hz, &link),
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -232,6 +241,34 @@ fn save_triggers(
     Ok(())
 }
 
+fn read_poll_rate(kb: &mut Keyboard) -> fizz::device::Result<Option<u32>> {
+    let reply = kb.request(
+        "polling rate",
+        &p::poll_rate_request(),
+        |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x09,
+        TIMEOUT,
+    )?;
+    Ok(p::parse_poll_rate(&reply))
+}
+
+fn set_poll_rate(kb: &mut Keyboard, hz: u32, link: &Link) -> fizz::device::Result<()> {
+    let Some(packet) = p::poll_rate_write(hz) else {
+        link.send(Update::Error(format!("{hz} Hz isn't a polling rate this keyboard supports.")));
+        return Ok(());
+    };
+    kb.write_only(&packet)?;
+    thread::sleep(Duration::from_millis(100));
+    let stored = read_poll_rate(kb)?;
+    link.send(Update::PollRateSet(stored));
+    if stored != Some(hz) {
+        link.send(Update::Error(format!(
+            "The keyboard didn't switch to {hz} Hz. It reports {}.",
+            stored.map_or("no rate".to_owned(), |r| format!("{r} Hz"))
+        )));
+    }
+    Ok(())
+}
+
 fn read_triggers(kb: &mut Keyboard) -> Option<Vec<Option<KeyTrigger>>> {
     let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
     let read = kb.read_key_triggers(&slots).ok()?;
@@ -257,15 +294,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         .request_same("serial number", &p::serial_request(), TIMEOUT)
         .ok()
         .and_then(|r| p::parse_serial(&r));
-    let poll_rate_hz = kb
-        .request(
-            "polling rate",
-            &p::poll_rate_request(),
-            |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x09,
-            TIMEOUT,
-        )
-        .ok()
-        .and_then(|r| p::parse_poll_rate(&r));
+    let poll_rate_hz = read_poll_rate(kb).ok().flatten();
     let modes = kb
         .request_same("light modes", &p::light_modes_request(Zone::Keys), TIMEOUT)
         .ok()

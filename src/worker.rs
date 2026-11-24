@@ -2,11 +2,13 @@
 //! blocks the UI. It reconnects automatically and sends a status heartbeat to
 //! notice when the cable is unplugged.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fizz::device::{Dir, Ident, Keyboard};
+use fizz::profile::{self, Profile, SectionResult};
 use fizz::protocol::{
     self as p, KeyAction, KeyTrigger, Layer, LightConfig, Macro, ModeList, Packet, ProductInfo, SocdPair,
     SocdPower, Status, TriggerConfig, Zone,
@@ -32,6 +34,10 @@ pub enum Request {
     SetSocdPower(bool),
     /// All 10 macro slots (they can only be saved together).
     SaveMacros(Vec<Option<Macro>>),
+    /// Read every setting and save it to this file.
+    SaveProfile(PathBuf),
+    /// Back up the current settings into `dir`, then write this profile.
+    RestoreProfile { profile: Box<Profile>, dir: PathBuf },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,6 +80,9 @@ pub enum Update {
     SocdPairsSaved(Vec<Option<SocdPair>>),
     SocdPowerSet(Option<SocdPower>),
     MacrosSaved(Vec<Option<Macro>>),
+    ProfileSaved(Result<PathBuf, String>),
+    /// What happened to each section, and where the previous settings were backed up.
+    ProfileRestored(Result<(Vec<SectionResult>, PathBuf), String>),
     Error(String),
     Packet(LogEntry),
 }
@@ -135,7 +144,9 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
                     | Request::SaveColours(..)
                     | Request::SaveSocdPairs(_)
                     | Request::SetSocdPower(_)
-                    | Request::SaveMacros(_),
+                    | Request::SaveMacros(_)
+                    | Request::SaveProfile(_)
+                    | Request::RestoreProfile { .. },
                 ) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
@@ -174,6 +185,10 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
             Ok(Request::SaveSocdPairs(pairs)) => save_socd_pairs(keyboard, &pairs, &link),
             Ok(Request::SetSocdPower(on)) => set_socd_power(keyboard, on, &link),
             Ok(Request::SaveMacros(macros)) => save_macros(keyboard, &macros, &link),
+            Ok(Request::SaveProfile(file)) => save_profile(keyboard, &file, &link),
+            Ok(Request::RestoreProfile { profile, dir }) => {
+                restore_profile(keyboard, &profile, &dir, &link)
+            }
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -203,11 +218,7 @@ fn heartbeat(kb: &mut Keyboard) -> fizz::device::Result<()> {
 }
 
 fn apply_light(kb: &mut Keyboard, cfg: &LightConfig, link: &Link) -> fizz::device::Result<()> {
-    kb.write_only(&p::light_config_write(Zone::Keys, cfg))?;
-    // Give the firmware a moment, then read back what it actually stored.
-    thread::sleep(Duration::from_millis(50));
-    let reply = kb.request_same("light config", &p::light_config_request(Zone::Keys), TIMEOUT)?;
-    match p::parse_light_config(Zone::Keys, &reply) {
+    match kb.write_light(Zone::Keys, cfg)? {
         Some(stored) => link.send(Update::LightApplied(stored)),
         None => link.send(Update::Error(
             "The keyboard sent an unexpected lighting reply.".into(),
@@ -266,24 +277,15 @@ fn save_triggers(
     Ok(())
 }
 
-fn read_poll_rate(kb: &mut Keyboard) -> fizz::device::Result<Option<u32>> {
-    let reply = kb.request(
-        "polling rate",
-        &p::poll_rate_request(),
-        |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x09,
-        TIMEOUT,
-    )?;
-    Ok(p::parse_poll_rate(&reply))
-}
-
 fn set_poll_rate(kb: &mut Keyboard, hz: u32, link: &Link) -> fizz::device::Result<()> {
-    let Some(packet) = p::poll_rate_write(hz) else {
-        link.send(Update::Error(format!("{hz} Hz isn't a polling rate this keyboard supports.")));
-        return Ok(());
+    let stored = match kb.set_poll_rate(hz) {
+        Ok(stored) => stored,
+        Err(fizz::device::Error::Invalid(_)) => {
+            link.send(Update::Error(format!("{hz} Hz isn't a polling rate this keyboard supports.")));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
     };
-    kb.write_only(&packet)?;
-    thread::sleep(Duration::from_millis(100));
-    let stored = read_poll_rate(kb)?;
     link.send(Update::PollRateSet(stored));
     if stored != Some(hz) {
         link.send(Update::Error(format!(
@@ -358,6 +360,49 @@ fn save_socd_pairs(
     Ok(())
 }
 
+fn write_profile_file(profile: &Profile, file: &Path) -> Result<(), String> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't create the folder: {e}."))?;
+    }
+    std::fs::write(file, profile.to_json()).map_err(|e| format!("Couldn't save the file: {e}."))
+}
+
+fn save_profile(kb: &mut Keyboard, file: &Path, link: &Link) -> fizz::device::Result<()> {
+    let profile = profile::read(kb)?;
+    let result = write_profile_file(&profile, file).map(|()| file.to_path_buf());
+    link.send(Update::ProfileSaved(result));
+    Ok(())
+}
+
+fn restore_profile(
+    kb: &mut Keyboard,
+    wanted: &Profile,
+    dir: &Path,
+    link: &Link,
+) -> fizz::device::Result<()> {
+    // Never write without a way back: save what the keyboard holds now first.
+    let current = profile::read(kb)?;
+    let backup = dir.join(format!("before-restore-{}.json", profile::file_stamp(current.saved_at)));
+    if let Err(e) = write_profile_file(&current, &backup) {
+        link.send(Update::ProfileRestored(Err(format!(
+            "{e} Nothing was changed on the keyboard."
+        ))));
+        return Ok(());
+    }
+    let outcome = match profile::apply(kb, wanted) {
+        Ok(results) => Ok((results, backup)),
+        Err(problems) => Err(format!(
+            "The file can't be restored: {} Nothing was changed on the keyboard.",
+            problems.join(" ")
+        )),
+    };
+    link.send(Update::ProfileRestored(outcome));
+    // Show what the keyboard holds now.
+    let snapshot = read_snapshot(kb);
+    link.send(Update::Snapshot(Box::new(snapshot)));
+    Ok(())
+}
+
 fn save_macros(kb: &mut Keyboard, macros: &[Option<Macro>], link: &Link) -> fizz::device::Result<()> {
     match kb.write_macros(macros) {
         Ok(Some(stored)) => {
@@ -421,7 +466,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         .request_same("serial number", &p::serial_request(), TIMEOUT)
         .ok()
         .and_then(|r| p::parse_serial(&r));
-    let poll_rate_hz = read_poll_rate(kb).ok().flatten();
+    let poll_rate_hz = kb.read_poll_rate().ok().flatten();
     let modes = kb
         .request_same("light modes", &p::light_modes_request(Zone::Keys), TIMEOUT)
         .ok()

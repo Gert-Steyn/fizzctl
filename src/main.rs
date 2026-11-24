@@ -2,6 +2,7 @@
 
 mod actuation_page;
 mod app;
+mod backup;
 mod capture;
 mod keyboard_view;
 mod keymap_page;

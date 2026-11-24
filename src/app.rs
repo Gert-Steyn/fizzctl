@@ -9,6 +9,7 @@ use fizz::protocol::{self as p, Layer, LightConfig};
 
 use crate::graphite::{self, Tone, Type, size, space};
 use crate::actuation_page::ActuationPage;
+use crate::backup::BackupSection;
 use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::keymap_page::{KeymapPage, Outcome};
 use crate::macros_page::MacrosPage;
@@ -94,6 +95,7 @@ pub struct FizzApp {
     actuation: ActuationPage,
     socd: SocdPage,
     macros: MacrosPage,
+    backup: BackupSection,
     applying: bool,
     /// Per-key colours being edited (Custom effect); `None` until read.
     colour_edit: Option<Vec<[u8; 3]>>,
@@ -153,6 +155,7 @@ impl FizzApp {
             actuation,
             socd: SocdPage::default(),
             macros: MacrosPage::default(),
+            backup: BackupSection::new(),
             applying: false,
             colour_edit: None,
             brush: [0xFF, 0xFF, 0xFF],
@@ -182,6 +185,7 @@ impl FizzApp {
                     self.actuation.reset();
                     self.socd.reset();
                     self.macros.reset();
+                    self.backup.on_error();
                 }
                 Update::Snapshot(snapshot) => {
                     let device_light = self.snapshot.as_ref().and_then(|s| s.light);
@@ -275,6 +279,14 @@ impl FizzApp {
                         )));
                     }
                 }
+                Update::ProfileSaved(result) => match self.backup.on_saved(result) {
+                    Ok(message) => self.notify(Notice::Success(message)),
+                    Err(message) => self.notify(Notice::Error(message)),
+                },
+                Update::ProfileRestored(result) => match self.backup.on_restored(result) {
+                    Ok(message) => self.notify(Notice::Success(message)),
+                    Err(message) => self.notify(Notice::Error(message)),
+                },
                 Update::PollRateSet(stored) => {
                     if let Some(s) = self.snapshot.as_mut() {
                         s.poll_rate_hz = stored;
@@ -287,6 +299,7 @@ impl FizzApp {
                     self.setting_poll_rate = None;
                 }
                 Update::Error(message) => {
+                    self.backup.on_error();
                     self.setting_poll_rate = None;
                     self.saving_colours = false;
                     self.applying = false;
@@ -829,6 +842,16 @@ impl FizzApp {
         });
 
         ui.add_space(space::S6);
+        let connected = self.device.is_some();
+        let product = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.product.as_ref())
+            .and_then(|p| p.product())
+            .map(str::to_owned);
+        self.backup.show(ui, &self.worker.tx, connected, product.as_deref());
+
+        ui.add_space(space::S6);
         section_heading(ui, "About");
         graphite::card(ui, |ui| {
             graphite::setting_row(ui, "Version", None, |ui| {
@@ -844,6 +867,9 @@ impl eframe::App for FizzApp {
         // A macro recording belongs to the Macros page: end it if we leave.
         if self.page != Page::Macros {
             self.macros.stop_recording();
+        }
+        if self.page != Page::Settings {
+            self.backup.invalidate();
         }
         let dark = ui.visuals().dark_mode;
 

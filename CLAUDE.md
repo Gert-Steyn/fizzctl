@@ -39,6 +39,9 @@ cargo run --bin fizz-probe -- --rewrite-poll-rate # writes the current polling r
 cargo run --bin fizz-probe -- --rewrite-colours [--layer 0|1]  # NOT a no-op: activates the layer and the Custom effect
 cargo run --bin fizz-probe -- --apply-light 2 4 4 FF0000 000000 2 1   # set lighting: mode bri spd fg bg dir rainbow
 cargo run --bin fizz-probe -- --rewrite-socd     # SOCD pairs + on/off back unchanged, verifies
+cargo run --bin fizz-probe -- --profile-export f.json   # read-only: every setting to a JSON file
+cargo run --bin fizz-probe -- --profile-restore f.json  # backs up current settings, then writes the file, verifying each section
+cargo run --bin fizz-probe -- --profile-roundtrip       # export, write everything back, export again, compare (no net change)
 cargo run --bin fizz-probe -- --survey           # read-only check of features not built yet
 cargo run --bin fizz-probe -- --read-macros      # read-only: all slots + which keys use macros
 cargo run --bin fizz-probe -- --macro-write-all-test  # all slots empty & unbound only: write a test macro, clear again
@@ -71,6 +74,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
 | `src/socd_page.rs` | Snap tap (SOCD) page: on/off (immediate), key pairs with modes, save. |
 | `src/macros_page.rs` | Macros page: 10 slots list + editor (play mode, steps, delays); saves all 10. Key mapping's picker offers defined macros. |
+| `src/profile.rs` | Whole-keyboard settings file (library): `Profile` (9 optional sections, JSON, `problems()` validation, no serial number), `read(kb)`, `apply(kb, &profile)` (fixed order, lighting last, read-back per section, stops on a cable pull), UTC date helpers. |
+| `src/backup.rs` | Settings page "Backup and restore": save to file, list saved files, Restore with a confirmation dialog (warns on a different keyboard model). Files in the app data folder `profiles` (Windows: `%APPDATA%\Fizz control\data\profiles`). |
 | `src/recorder.rs` | Macro recorder core (egui-free, in the library): key-down/up events with timestamps become steps; keeps the macro valid (every press released, 40-step cap, releases owed reserved). `is_balanced` lives here. |
 | `src/capture.rs` | egui events to HID events for the recorder: `hid_code(egui::Key)`, `key_events` (reads `physical_key`, drops auto-repeat, turns `Copy`/`Cut`/`Paste` events back into C/X/V). |
 | `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
@@ -152,6 +157,10 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   (extended) for real arrows. Always check the foreground window title before sending input.
   `AppActivate(pid)` + `SetForegroundWindow` brings the app forward; `MoveWindow` resizes it. The
   screen work area is 1920x1032, so use mouse-wheel scrolling to see long pages.
+- Windows Store Python can't see `%APPDATA%\Roaming` (it is virtualized): copy files out with
+  PowerShell before reading them from Python.
+- Windows PowerShell 5.1 `Set-Content -Encoding utf8` writes a UTF-8 byte-order mark; the profile
+  loader strips it (Notepad does the same).
 - Reading the vendor JS: never execute it; `tools/decode_app.py` works statically. Run Python on
   downloaded files with `python -I`.
 - hidapi on Windows prefixes input reports with the report ID (64 bytes); `Keyboard::recv` strips it.
@@ -235,6 +244,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Per-key colours (Custom effect: paint keys on the Lighting page) | Done. Read verified; colour write verified (acks + read-back); lighting write verified via probe. Painting from the GUI not yet tried |
 | Macros: 10 slots, play modes, key/mouse steps with delays; assign via Key mapping | Done. Read verified; save path verified with the vendor-style all-slots write (test macro in, cleared again). Recording keys by typing is done and was tested with real key presses (letters, Shift+A, Ctrl+C, Space, F5, Tab, Enter, arrows; held key + focus loss). Saving a real macro via the GUI and assigning it not yet tried |
 | Snap tap (SOCD): on/off, up to 20 pairs with 4 modes | Done. Read verified; no-op writes verified; a real change via the GUI not yet tried |
+| Backup and restore of all settings (Settings page; 9 sections) | Done. Probe round trip passed (everything written back, read again, identical). Save and Restore clicked in the real app: restored, the safety backup written first, keyboard identical afterwards |
 | Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
@@ -269,8 +279,10 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
    Original notes: `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
    delete `[1]=3 [4]=index`. Step = `{keyCode, type|state<<4, delayHi, delayLo}`. Key-map kind `0x10`
    with `arg1` = macro index. Needs a recorder UI.
-6. Then: calibration (ask first); dead zones and advanced keys only after a test proves the
-   firmware uses them; export/import of all settings; restore a `backups/` file. Skip: profiles (no
+6. ~~Export/import of all settings~~ done 2026-11-24 (Settings page; also restores files made by
+   the probe's `--profile-export`). Possible follow-ups: import from any path with a file dialog,
+   delete saved files, restore only chosen sections. Then: calibration (ask first); dead zones and
+   advanced keys only after a test proves the firmware uses them. Skip: profiles (no
    reply), locks (flag off), switch types (one type), sleep timer (blocked command).
 7. Release (after the features, per Gert): app icon, single `.exe`, GitHub Actions building Windows + Linux binaries; run on Linux once.
 
@@ -279,7 +291,6 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 - Does `0x14 02` mean factory reset or sleep-timer read on this firmware? Keep blocked until proven.
 - Fn layer "built-in actions": which Fn combos does the firmware provide (Fn+1..= → F1..F12?)? Could
   be listed in the UI once known (observe with the packet log / key tester).
-- Import/export of a full profile (JSON) like the vendor's `exportProfile`.
 
 ## Gert's preferences
 - Rust, cross-platform (Windows first, Linux next), apps styled with his Graphite system.

@@ -15,6 +15,9 @@
 //! cargo run --bin fizz-probe -- --macro-write-test
 //! cargo run --bin fizz-probe -- --dump-macro <slot>
 //! cargo run --bin fizz-probe -- --clear-macro <slot>
+//! cargo run --bin fizz-probe -- --profile-export settings.json
+//! cargo run --bin fizz-probe -- --profile-restore settings.json
+//! cargo run --bin fizz-probe -- --profile-roundtrip
 //! cargo run --bin fizz-probe -- --survey      # read-only check of the remaining features
 //! ```
 //!
@@ -129,6 +132,20 @@ fn main() {
     if std::env::args().any(|a| a == "--macro-write-test") {
         let ok = macro_write_test(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
+    }
+    let arg_after = |flag: &str| {
+        std::env::args()
+            .position(|a| a == flag)
+            .and_then(|i| std::env::args().nth(i + 1))
+    };
+    if let Some(file) = arg_after("--profile-export") {
+        std::process::exit(if profile_export(&mut kb, &file) { 0 } else { 2 });
+    }
+    if let Some(file) = arg_after("--profile-restore") {
+        std::process::exit(if profile_restore(&mut kb, &file) { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--profile-roundtrip") {
+        std::process::exit(if profile_roundtrip(&mut kb) { 0 } else { 2 });
     }
     if std::env::args().any(|a| a == "--survey") {
         survey(&mut kb);
@@ -1088,6 +1105,154 @@ fn macro_write_all_test(kb: &mut Keyboard) -> bool {
     println!("\nWriting all 10 slots empty again");
     let second = write_all(kb, false).is_some();
     let ok = first && second;
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+fn print_sections(profile: &fizz::profile::Profile) {
+    let names: Vec<_> = profile.sections().iter().map(|s| s.name()).collect();
+    println!(
+        "  product {:?}, firmware {:?}; sections: {}",
+        profile.product,
+        profile.firmware,
+        names.join(", ")
+    );
+}
+
+fn profile_export(kb: &mut Keyboard, file: &str) -> bool {
+    kb.on_packet = None;
+    match fizz::profile::read(kb) {
+        Ok(profile) => {
+            if let Err(e) = std::fs::write(file, profile.to_json()) {
+                println!("\ncouldn't write {file}: {e}");
+                return false;
+            }
+            println!("\nsaved {file}");
+            print_sections(&profile);
+            true
+        }
+        Err(e) => {
+            println!("\ncouldn't read the keyboard: {e}");
+            false
+        }
+    }
+}
+
+/// Which sections of two profiles differ (ignoring the save time).
+fn differing(a: &fizz::profile::Profile, b: &fizz::profile::Profile) -> Vec<&'static str> {
+    use fizz::profile::Section;
+    let mut out = Vec::new();
+    let same = [
+        (Section::Macros, a.macros == b.macros),
+        (Section::KeyMapDefault, a.keymap_default == b.keymap_default),
+        (Section::KeyMapFn, a.keymap_fn == b.keymap_fn),
+        (Section::Colours, a.colours == b.colours && a.colour_layer == b.colour_layer),
+        (Section::Actuation, a.triggers == b.triggers),
+        (Section::SocdPairs, a.socd_pairs == b.socd_pairs),
+        (Section::SocdPower, a.socd_on == b.socd_on),
+        (Section::PollRate, a.poll_rate_hz == b.poll_rate_hz),
+        (Section::Lighting, a.light == b.light),
+    ];
+    for (section, same) in same {
+        if !same {
+            out.push(section.name());
+        }
+    }
+    out
+}
+
+fn apply_and_report(kb: &mut Keyboard, profile: &fizz::profile::Profile) -> bool {
+    use fizz::profile::Outcome;
+    match fizz::profile::apply(kb, profile) {
+        Err(problems) => {
+            println!("  the profile isn't safe to write:");
+            for p in problems {
+                println!("    - {p}");
+            }
+            false
+        }
+        Ok(results) => {
+            let mut ok = true;
+            for r in &results {
+                let line = match &r.outcome {
+                    Outcome::Applied => "applied and read back identical".to_owned(),
+                    Outcome::NotInProfile => "not in the profile".to_owned(),
+                    Outcome::Mismatch(m) => {
+                        ok = false;
+                        format!("MISMATCH: {m}")
+                    }
+                    Outcome::Failed(m) => {
+                        ok = false;
+                        format!("FAILED: {m}")
+                    }
+                };
+                println!("  {:<20} {line}", r.section.name());
+            }
+            ok
+        }
+    }
+}
+
+fn backup_profile(kb: &mut Keyboard, name: &str) -> Option<fizz::profile::Profile> {
+    let current = fizz::profile::read(kb).ok()?;
+    let file = format!("backups/{name}-{}.json", fizz::profile::file_stamp(current.saved_at));
+    std::fs::create_dir_all("backups").ok()?;
+    std::fs::write(&file, current.to_json()).ok()?;
+    println!("  backup of the current settings: {file}");
+    Some(current)
+}
+
+fn profile_restore(kb: &mut Keyboard, file: &str) -> bool {
+    kb.on_packet = None;
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("\ncouldn't read {file}: {e}");
+            return false;
+        }
+    };
+    let profile = match fizz::profile::Profile::from_json(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\n{e}");
+            return false;
+        }
+    };
+    println!("\nRestoring {file}");
+    print_sections(&profile);
+    if backup_profile(kb, "before-restore").is_none() {
+        println!("  couldn't back up the current settings, stopping without writing anything");
+        return false;
+    }
+    let ok = apply_and_report(kb, &profile);
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Read everything, write it all back, read again, and compare. Ends with
+/// the keyboard in the state it started in, or says what differs.
+fn profile_roundtrip(kb: &mut Keyboard) -> bool {
+    kb.on_packet = None;
+    println!("\nReading every setting");
+    let Some(before) = backup_profile(kb, "roundtrip") else {
+        println!("  couldn't read or save the settings, stopping without writing anything");
+        return false;
+    };
+    print_sections(&before);
+    println!("\nWriting everything back");
+    let applied = apply_and_report(kb, &before);
+    println!("\nReading everything again");
+    let Ok(after) = fizz::profile::read(kb) else {
+        println!("  couldn't read the keyboard");
+        return false;
+    };
+    let diff = differing(&before, &after);
+    if diff.is_empty() {
+        println!("  identical to before");
+    } else {
+        println!("  DIFFERENT: {}", diff.join(", "));
+    }
+    let ok = applied && diff.is_empty();
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
 }

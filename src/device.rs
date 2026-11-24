@@ -30,6 +30,8 @@ pub enum Error {
     Timeout(&'static str),
     Blocked,
     Incomplete,
+    /// A value the keyboard has no setting for.
+    Invalid(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -39,7 +41,8 @@ impl fmt::Display for Error {
             Error::Hid(e) => write!(f, "{e}"),
             Error::Timeout(what) => write!(f, "no reply to {what}"),
             Error::Blocked => write!(f, "refused to send a blocked command"),
-            Error::Incomplete => write!(f, "refused to write an incomplete key map"),
+            Error::Incomplete => write!(f, "refused to write an incomplete list"),
+            Error::Invalid(what) => write!(f, "invalid value: {what}"),
         }
     }
 }
@@ -437,6 +440,61 @@ impl Keyboard {
             }
         }
         self.read_macro_raw(slot)
+    }
+
+    /// The status reply: feature flags and the like.
+    pub fn read_status(&mut self) -> Result<Option<protocol::Status>> {
+        let reply = self.request_same("status", &protocol::status_request(), REPLY_TIMEOUT)?;
+        Ok(protocol::parse_status(&reply))
+    }
+
+    /// Product code, firmware version and build date.
+    pub fn read_product_info(&mut self) -> Result<Option<protocol::ProductInfo>> {
+        let pages = self.request_pages(
+            "product info",
+            &protocol::product_info_request(),
+            1,
+            REPLY_TIMEOUT,
+            PAGE_IDLE,
+        )?;
+        Ok(protocol::parse_product_info(&pages))
+    }
+
+    /// The key lighting (or side light) configuration.
+    pub fn read_light(&mut self, zone: protocol::Zone) -> Result<Option<protocol::LightConfig>> {
+        let reply = self.request_same("light config", &protocol::light_config_request(zone), REPLY_TIMEOUT)?;
+        Ok(protocol::parse_light_config(zone, &reply))
+    }
+
+    /// Set the lighting and read back what the keyboard stored.
+    pub fn write_light(
+        &mut self,
+        zone: protocol::Zone,
+        cfg: &protocol::LightConfig,
+    ) -> Result<Option<protocol::LightConfig>> {
+        self.write_only(&protocol::light_config_write(zone, cfg))?;
+        // Give the firmware a moment before reading it back.
+        std::thread::sleep(Duration::from_millis(50));
+        self.read_light(zone)
+    }
+
+    /// The polling rate in Hz.
+    pub fn read_poll_rate(&mut self) -> Result<Option<u32>> {
+        let reply = self.request(
+            "polling rate",
+            &protocol::poll_rate_request(),
+            |r| r[0] == protocol::cmd::PROFILE_TRIGGER && r[5] == 0x09,
+            REPLY_TIMEOUT,
+        )?;
+        Ok(protocol::parse_poll_rate(&reply))
+    }
+
+    /// Set the polling rate and read back what the keyboard reports.
+    pub fn set_poll_rate(&mut self, hz: u32) -> Result<Option<u32>> {
+        let packet = protocol::poll_rate_write(hz).ok_or(Error::Invalid("polling rate"))?;
+        self.write_only(&packet)?;
+        std::thread::sleep(Duration::from_millis(100));
+        self.read_poll_rate()
     }
 
     /// Every macro slot, decoded; `None` overall if any slot didn't read.

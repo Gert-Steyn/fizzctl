@@ -6,5 +6,6 @@
 
 pub mod device;
 pub mod keymap;
+pub mod profile;
 pub mod protocol;
 pub mod recorder;

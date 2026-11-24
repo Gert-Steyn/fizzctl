@@ -26,6 +26,7 @@ cargo run --bin fizz-probe -- --rewrite-keymap
 cargo run --bin fizz-probe -- --rewrite-triggers
 cargo run --bin fizz-probe -- --rewrite-poll-rate
 cargo run --bin fizz-probe -- --rewrite-socd
+cargo run --bin fizz-probe -- --profile-roundtrip
 ```
 
 ## What works
@@ -41,6 +42,7 @@ cargo run --bin fizz-probe -- --rewrite-socd
 | Actuation point and rapid trigger, per key or many keys at once | Read and write |
 | Snap tap (SOCD): on/off and up to 20 key pairs with 4 modes | Read and write |
 | Macros: 10 macros of key presses and clicks with delays, 4 play modes, assigned to keys via Key mapping; record steps by typing | Read and write |
+| Backup and restore of every setting to a file, with an automatic safety backup before a restore | Yes |
 | Packet log of all traffic | Yes |
 | Calibration | Not built yet |
 | Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
@@ -53,6 +55,18 @@ point, rapid trigger, and its sensitivity (one value, or separate press and
 release). Only the settings you change are applied to the selected keys.
 **Save actuation** sends one packet per distinct setting and reads every
 changed key back to check it.
+
+### Backup and restore
+
+Settings, **Backup and restore**: **Save settings** reads every setting on the
+keyboard (key maps, lighting, key colours, actuation, snap tap, macros and
+polling rate) and saves it as a JSON file in the app's data folder; **Open
+folder** shows where. **Restore** next to a file writes it back after a
+confirmation. Before anything is written, the current settings are saved as a
+"before a restore" file, so a restore can always be undone, and each section is
+read back afterwards to check it. Files hold the keyboard's product code and
+firmware but no serial number, so they are safe to share, and the app warns if
+a file came from a different keyboard model.
 
 ### Macros
 
@@ -83,6 +97,7 @@ only key lighting is shown.
 - `src/protocol.rs`: packet builders and parsers, no I/O, unit-tested
 - `src/device.rs`: opens the vendor HID interface (usage page `0xFF1B`) and does request/reply
 - `src/worker.rs`: background thread that owns the connection, reconnects and sends heartbeats
+- `src/profile.rs` and `src/backup.rs`: the settings file format (read, validate, apply) and the Settings page section for it
 - `src/recorder.rs` and `src/capture.rs`: macro recording (event-to-step logic, and egui keys to HID codes)
 - `src/keymap.rs`: the key catalogue (English names) and this keyboard's 61-key layout
 - `src/app.rs`: the window; `src/keymap_page.rs`: the key mapping page; `src/graphite.rs`: the shared theme module

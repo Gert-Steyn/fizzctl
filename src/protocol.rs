@@ -340,7 +340,7 @@ pub fn parse_mode_list(zone: Zone, reply: &Packet) -> Option<ModeList> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LightConfig {
     pub mode: u8,
     pub brightness: u8,
@@ -468,7 +468,7 @@ impl Layer {
 /// `kind` 0 is an ordinary key with `code` = HID usage. Other kinds (media,
 /// mouse, shortcut, lighting…) are listed in `keymap.rs`. Unknown values are
 /// kept as-is so writing a layer back never changes keys we didn't touch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct KeyAction {
     pub kind: u8,
     pub code: u8,
@@ -642,7 +642,7 @@ pub fn parse_trigger_config(reply: &Packet, high_precision: bool) -> Option<Trig
 }
 
 /// One key's actuation settings. Travel values are in [`TriggerConfig`] steps.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct KeyTrigger {
     pub mode: u8,
     /// Actuation point.
@@ -783,7 +783,7 @@ pub mod socd_mode {
 }
 
 /// One SOCD pair: two keys (HID usage codes) and how they resolve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SocdPair {
     /// Stored as 1 for an active pair by the vendor app.
     pub state: u8,
@@ -912,7 +912,7 @@ pub mod macro_play {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MacroStep {
     /// Key down (true) or key up.
     pub press: bool,
@@ -924,7 +924,7 @@ pub struct MacroStep {
     pub delay_ms: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Macro {
     pub play: u8,
     /// Repeat count, used when `play` is [`macro_play::TIMES`].

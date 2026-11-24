@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use fizz::device::{Dir, Ident, Keyboard};
 use fizz::protocol::{
-    self as p, KeyAction, Layer, LightConfig, ModeList, Packet, ProductInfo, Status, Zone,
+    self as p, KeyAction, KeyTrigger, Layer, LightConfig, ModeList, Packet, ProductInfo, Status,
+    TriggerConfig, Zone,
 };
 
 const TIMEOUT: Duration = Duration::from_millis(400);
@@ -21,6 +22,8 @@ pub enum Request {
     Refresh,
     ApplyLight(LightConfig),
     SaveKeymap(Layer, Vec<KeyAction>),
+    /// Actuation settings, grouped: each setting with the slots it applies to.
+    SaveTriggers(Vec<(KeyTrigger, Vec<usize>)>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,6 +36,9 @@ pub struct Snapshot {
     pub light: Option<LightConfig>,
     pub keymap_default: Option<Vec<KeyAction>>,
     pub keymap_fn: Option<Vec<KeyAction>>,
+    pub trigger_config: Option<TriggerConfig>,
+    /// Actuation per slot (`KEY_SLOTS` long); `None` for empty slots or keys that didn't answer.
+    pub triggers: Option<Vec<Option<KeyTrigger>>>,
 }
 
 pub struct LogEntry {
@@ -44,9 +50,10 @@ pub struct LogEntry {
 pub enum Update {
     Connected(Ident),
     Disconnected,
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     LightApplied(LightConfig),
     KeymapSaved(Layer, Vec<KeyAction>),
+    TriggersSaved(Vec<(usize, Option<KeyTrigger>)>),
     Error(String),
     Packet(LogEntry),
 }
@@ -100,7 +107,7 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
     loop {
         let Some(keyboard) = kb.as_mut() else {
             match rx.recv_timeout(RECONNECT_EVERY) {
-                Ok(Request::ApplyLight(_) | Request::SaveKeymap(..)) => {
+                Ok(Request::ApplyLight(_) | Request::SaveKeymap(..) | Request::SaveTriggers(_)) => {
                     link.send(Update::Error("The keyboard isn't connected.".into()));
                 }
                 Ok(Request::Refresh) | Err(RecvTimeoutError::Timeout) => {}
@@ -118,7 +125,7 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
                 }));
                 link.send(Update::Connected(opened.ident.clone()));
                 let snapshot = read_snapshot(&mut opened);
-                link.send(Update::Snapshot(snapshot));
+                link.send(Update::Snapshot(Box::new(snapshot)));
                 kb = Some(opened);
             }
             continue;
@@ -127,11 +134,12 @@ fn run(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Update>) {
         let result = match rx.recv_timeout(HEARTBEAT_EVERY) {
             Ok(Request::Refresh) => {
                 let snapshot = read_snapshot(keyboard);
-                link.send(Update::Snapshot(snapshot));
+                link.send(Update::Snapshot(Box::new(snapshot)));
                 Ok(())
             }
             Ok(Request::ApplyLight(cfg)) => apply_light(keyboard, &cfg, &link),
             Ok(Request::SaveKeymap(layer, keys)) => save_keymap(keyboard, layer, &keys, &link),
+            Ok(Request::SaveTriggers(groups)) => save_triggers(keyboard, &groups, &link),
             Err(RecvTimeoutError::Timeout) => heartbeat(keyboard),
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -208,6 +216,32 @@ fn save_keymap(
     Ok(())
 }
 
+fn save_triggers(
+    kb: &mut Keyboard,
+    groups: &[(KeyTrigger, Vec<usize>)],
+    link: &Link,
+) -> fizz::device::Result<()> {
+    let result = kb.write_key_triggers(groups)?;
+    link.send(Update::TriggersSaved(result.stored));
+    if !result.verified {
+        link.send(Update::Error(
+            "Some keys reported different actuation settings after saving. The page now shows what they report."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_triggers(kb: &mut Keyboard) -> Option<Vec<Option<KeyTrigger>>> {
+    let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
+    let read = kb.read_key_triggers(&slots).ok()?;
+    let mut all = vec![None; p::KEY_SLOTS];
+    for (slot, t) in slots.into_iter().zip(read) {
+        all[slot] = t;
+    }
+    Some(all)
+}
+
 /// Read everything the overview and lighting pages show. Each query is
 /// independent: one failing leaves that field empty.
 fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
@@ -242,6 +276,9 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         .and_then(|r| p::parse_light_config(Zone::Keys, &r));
     let keymap_default = kb.read_keymap(Layer::Default).ok().flatten();
     let keymap_fn = kb.read_keymap(Layer::Fn).ok().flatten();
+    let high_precision = status.as_ref().is_some_and(|s| s.support.high_precision);
+    let trigger_config = kb.read_trigger_config(high_precision).ok().flatten();
+    let triggers = read_triggers(kb);
     Snapshot {
         status,
         product,
@@ -251,5 +288,7 @@ fn read_snapshot(kb: &mut Keyboard) -> Snapshot {
         light,
         keymap_default,
         keymap_fn,
+        trigger_config,
+        triggers,
     }
 }

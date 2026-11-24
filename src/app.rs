@@ -8,6 +8,7 @@ use fizz::device::{Dir, Ident, PRODUCT_IDS};
 use fizz::protocol::{self as p, Layer, LightConfig};
 
 use crate::graphite::{self, Tone, Type, size, space};
+use crate::actuation_page::ActuationPage;
 use crate::keymap_page::{KeymapPage, Outcome};
 use crate::worker::{LogEntry, Request, Snapshot, Update, Worker};
 
@@ -36,6 +37,7 @@ impl ThemeChoice {
 enum Page {
     Overview,
     Keymap,
+    Actuation,
     Lighting,
     Packets,
     Settings,
@@ -46,6 +48,7 @@ impl Page {
         match self {
             Page::Overview => "Overview",
             Page::Keymap => "Key mapping",
+            Page::Actuation => "Actuation",
             Page::Lighting => "Lighting",
             Page::Packets => "Packet log",
             Page::Settings => "Settings",
@@ -56,6 +59,7 @@ impl Page {
         match self {
             Page::Overview => Icon::Info,
             Page::Keymap => Icon::Keyboard,
+            Page::Actuation => Icon::Gauge,
             Page::Lighting => Icon::Lightbulb,
             Page::Packets => Icon::Terminal,
             Page::Settings => Icon::Settings,
@@ -78,6 +82,7 @@ pub struct FizzApp {
     /// Lighting being edited; `None` until the keyboard has been read.
     light_edit: Option<LightConfig>,
     keymap: KeymapPage,
+    actuation: ActuationPage,
     applying: bool,
     notice: Option<(Notice, Instant)>,
     log: VecDeque<LogEntry>,
@@ -101,14 +106,17 @@ impl FizzApp {
         }
         let page = match env("FIZZ_PAGE").as_str() {
             "keys" => Page::Keymap,
+            "actuation" => Page::Actuation,
             "lighting" => Page::Lighting,
             "packets" => Page::Packets,
             "settings" => Page::Settings,
             _ => Page::Overview,
         };
         let mut keymap = KeymapPage::default();
+        let mut actuation = ActuationPage::default();
         if let Ok(slot) = env("FIZZ_KEY").parse() {
             keymap.select(slot);
+            actuation.select(slot);
         }
         if env("FIZZ_LAYER") == "fn" {
             keymap.set_layer(Layer::Fn);
@@ -122,6 +130,7 @@ impl FizzApp {
             snapshot: None,
             light_edit: None,
             keymap,
+            actuation,
             applying: false,
             notice: None,
             log: VecDeque::new(),
@@ -142,6 +151,7 @@ impl FizzApp {
                     self.light_edit = None;
                     self.applying = false;
                     self.keymap.reset();
+                    self.actuation.reset();
                 }
                 Update::Snapshot(snapshot) => {
                     let device_light = self.snapshot.as_ref().and_then(|s| s.light);
@@ -150,7 +160,8 @@ impl FizzApp {
                         self.light_edit = snapshot.light;
                     }
                     self.keymap.on_snapshot(&snapshot);
-                    self.snapshot = Some(snapshot);
+                    self.actuation.on_snapshot(&snapshot);
+                    self.snapshot = Some(*snapshot);
                 }
                 Update::LightApplied(stored) => {
                     if let Some(s) = self.snapshot.as_mut() {
@@ -171,9 +182,21 @@ impl FizzApp {
                         self.notify(Notice::Success("Key map saved to the keyboard.".into()));
                     }
                 }
+                Update::TriggersSaved(stored) => {
+                    if let Some(s) = self.snapshot.as_mut()
+                        && let Some(all) = s.triggers.as_mut()
+                    {
+                        for (slot, t) in &stored {
+                            all[*slot] = *t;
+                        }
+                    }
+                    self.actuation.on_saved(stored);
+                    self.notify(Notice::Success("Actuation saved to the keyboard.".into()));
+                }
                 Update::Error(message) => {
                     self.applying = false;
                     self.keymap.on_error();
+                    self.actuation.on_error();
                     self.notify(Notice::Error(message));
                 }
                 Update::Packet(entry) => {
@@ -205,7 +228,7 @@ impl FizzApp {
             ui.label(graphite::text("Fizz control", Type::Heading));
         });
         ui.add_space(space::S4);
-        for page in [Page::Overview, Page::Keymap, Page::Lighting, Page::Packets] {
+        for page in [Page::Overview, Page::Keymap, Page::Actuation, Page::Lighting, Page::Packets] {
             if graphite::nav_row(ui, Some(page.icon()), page.title(), self.page == page).clicked()
             {
                 self.page = page;
@@ -615,6 +638,11 @@ impl eframe::App for FizzApp {
                     Page::Keymap => {
                         if self.connected_or_placeholder(ui).is_some() {
                             self.keymap.show(ui, &self.worker.tx);
+                        }
+                    }
+                    Page::Actuation => {
+                        if self.connected_or_placeholder(ui).is_some() {
+                            self.actuation.show(ui, &self.worker.tx);
                         }
                     }
                     page => {

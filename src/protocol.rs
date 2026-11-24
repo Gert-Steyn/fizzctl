@@ -511,6 +511,150 @@ pub fn is_storing(status_reply: &Packet) -> bool {
     status_reply[0] == cmd::STATUS && status_reply[0x16] & 0x02 != 0
 }
 
+// ---------------------------------------------------------------------------
+// Actuation and rapid trigger (command 0x21, byte 4 = 0x18)
+// ---------------------------------------------------------------------------
+
+const TRIGGER_GROUP: u8 = 0x18;
+pub const TRIGGER_COLS: usize = 22;
+
+/// Trigger modes stored per key.
+pub mod trigger_mode {
+    /// Fixed actuation point.
+    pub const NORMAL: u8 = 0x00;
+    /// Older rapid-trigger mode; treated like `RT_SINGLE`.
+    pub const RT_LEGACY: u8 = 0x01;
+    /// Rapid trigger, one sensitivity for press and release.
+    pub const RT_SINGLE: u8 = 0x0C;
+    /// Rapid trigger, separate press and release sensitivities.
+    pub const RT_SPLIT: u8 = 0x0D;
+
+    pub const fn is_rapid(mode: u8) -> bool {
+        matches!(mode, RT_LEGACY | RT_SINGLE | RT_SPLIT)
+    }
+}
+
+fn trigger_packet(sub: u8) -> Packet {
+    let mut p = packet(cmd::PROFILE_TRIGGER);
+    p[4] = TRIGGER_GROUP;
+    p[5] = sub;
+    p
+}
+
+pub fn trigger_config_request() -> Packet {
+    trigger_packet(0x04)
+}
+
+/// Per-key trigger settings for the key at `slot` (`22 * row + col`).
+pub fn key_trigger_request(slot: usize) -> Packet {
+    let mut p = trigger_packet(0x05);
+    p[6] = (slot / TRIGGER_COLS) as u8;
+    p[7] = (slot % TRIGGER_COLS) as u8;
+    p
+}
+
+/// Travel limits and step size, from the reply to [`trigger_config_request`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TriggerConfig {
+    /// Millimetres per step. Every travel value on the wire is in steps.
+    pub unit_mm: f32,
+    /// Shallowest actuation point, in steps.
+    pub min_steps: u16,
+    /// Deepest actuation point, in steps.
+    pub max_steps: u16,
+    /// Millimetres per rapid-trigger sensitivity step.
+    pub rt_unit_mm: f32,
+}
+
+impl TriggerConfig {
+    pub fn mm(&self, steps: u16) -> f32 {
+        steps as f32 * self.unit_mm
+    }
+
+    pub fn steps(&self, mm: f32) -> u16 {
+        (mm / self.unit_mm).round().max(0.0) as u16
+    }
+
+    /// Largest rapid-trigger sensitivity the vendor app offers: half the full travel.
+    pub fn rt_max_steps(&self) -> u16 {
+        self.max_steps.div_ceil(2).max(1)
+    }
+}
+
+/// `high_precision` comes from the status support flags: it switches the
+/// unit divisor from 100 to 1000.
+pub fn parse_trigger_config(reply: &Packet, high_precision: bool) -> Option<TriggerConfig> {
+    if reply[0] != cmd::PROFILE_TRIGGER || reply[5] != 0x04 {
+        return None;
+    }
+    let divisor = if high_precision { 1000.0 } else { 100.0 };
+    let unit_raw = match reply[7] {
+        0 => 10,
+        n => n,
+    };
+    let rt_unit_raw = match reply[8] {
+        0 => 10,
+        n => n,
+    };
+    let unit_mm = unit_raw as f32 / divisor;
+    let max_steps = u16::from_le_bytes([reply[6], reply[9]]);
+    let min_steps = match reply[10] {
+        // Fallbacks the vendor app uses when the keyboard reports 0.
+        0 if (unit_mm - 0.04).abs() < 1e-6 => 3,
+        0 => 1,
+        n => n as u16,
+    };
+    Some(TriggerConfig {
+        unit_mm,
+        min_steps,
+        max_steps,
+        rt_unit_mm: rt_unit_raw as f32 / divisor,
+    })
+}
+
+/// One key's actuation settings. Travel values are in [`TriggerConfig`] steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyTrigger {
+    pub mode: u8,
+    /// Actuation point.
+    pub travel: u16,
+    /// Rapid trigger: how far the key must move down again to re-press.
+    pub press: u16,
+    /// Rapid trigger: how far the key must rise to release.
+    pub release: u16,
+}
+
+pub fn parse_key_trigger(reply: &Packet) -> Option<KeyTrigger> {
+    if reply[0] != cmd::PROFILE_TRIGGER || reply[5] != 0x05 {
+        return None;
+    }
+    Some(KeyTrigger {
+        mode: reply[6],
+        travel: u16::from_le_bytes([reply[7], reply[11]]),
+        press: u16::from_le_bytes([reply[9], reply[13]]),
+        release: u16::from_le_bytes([reply[10], reply[14]]),
+    })
+}
+
+/// Set the same trigger settings on every key in `slots`. One packet covers
+/// any number of keys: a bitmap with one byte per column, one bit per row.
+pub fn key_trigger_write(trigger: &KeyTrigger, slots: &[usize]) -> Packet {
+    let mut p = packet(cmd::PROFILE_TRIGGER);
+    p[4] = TRIGGER_GROUP;
+    p[5] = trigger.mode;
+    for &slot in slots {
+        let (row, col) = (slot / TRIGGER_COLS, slot % TRIGGER_COLS);
+        if row < 8 {
+            p[6 + col] |= 1 << row;
+        }
+    }
+    let [t_lo, t_hi] = trigger.travel.to_le_bytes();
+    let [p_lo, p_hi] = trigger.press.to_le_bytes();
+    let [r_lo, r_hi] = trigger.release.to_le_bytes();
+    p[28..36].copy_from_slice(&[t_lo, t_lo, p_lo, r_lo, t_hi, t_hi, p_hi, r_hi]);
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +732,32 @@ mod tests {
         assert_eq!(parse_keymap(Layer::Default, &replies), Some(keys));
         // A missing page must not parse as a complete layer.
         assert_eq!(parse_keymap(Layer::Default, &replies[..9]), None);
+    }
+
+    #[test]
+    fn trigger_replies_from_the_real_keyboard_parse() {
+        // Captured 2026-11-24: config, then the Esc key.
+        let config = reply(&[0x21, 0, 0, 0, 0x06, 0x04, 0x54, 0x01, 0x01, 0x01, 0x0A]);
+        let c = parse_trigger_config(&config, false).unwrap();
+        assert_eq!((c.min_steps, c.max_steps), (10, 340));
+        assert!((c.unit_mm - 0.01).abs() < 1e-6);
+        assert!((c.mm(c.max_steps) - 3.4).abs() < 1e-4);
+
+        let esc = reply(&[0x21, 0, 0, 0, 0x0C, 0x05, 0x0C, 0xAA, 0xAA, 0x33, 0x33, 0, 0, 0, 0, 1, 0]);
+        let t = parse_key_trigger(&esc).unwrap();
+        assert_eq!(t, KeyTrigger { mode: trigger_mode::RT_SINGLE, travel: 170, press: 51, release: 51 });
+    }
+
+    #[test]
+    fn trigger_write_sets_bitmap_and_values() {
+        let t = KeyTrigger { mode: trigger_mode::RT_SPLIT, travel: 0x0123, press: 40, release: 60 };
+        // Esc (row 1, col 0), Fn (row 5, col 10), Q (row 2, col 1).
+        let p = key_trigger_write(&t, &[22, 120, 45]);
+        assert_eq!(&p[..6], &[0x21, 0, 0, 0, 0x18, 0x0D]);
+        assert_eq!(p[6], 1 << 1); // column 0: row 1
+        assert_eq!(p[7], 1 << 2); // column 1: row 2
+        assert_eq!(p[16], 1 << 5); // column 10: row 5
+        assert_eq!(&p[28..36], &[0x23, 0x23, 40, 60, 0x01, 0x01, 0, 0]);
     }
 
     #[test]

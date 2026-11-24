@@ -12,9 +12,11 @@ moves. `PROTOCOL.md` is the full protocol reference; this file holds context, ru
 - Config channel: interface `MI_02`, usage page `0xFF1B`, usage `0x91`. Windows opens it with no
   driver; Linux needs `linux/99-fizz.rules`.
 - Product code `7153USHEXYXACPARGB`, firmware `3.17.01` (built Oct 22 2025), US 60% layout, 61 keys.
-- Supports: per-key RGB, polling rate (currently 8000 Hz), key calibration (calibrated). Does
-  **not** report rapid-trigger/DKS/dead-band/music flags in its status, but it is a magnetic board,
-  so the `0x21 / 0x18` trigger commands still need to be tried read-only before assuming anything.
+- Supports: per-key RGB, polling rate (currently 8000 Hz), key calibration (calibrated). Its status
+  does **not** set the RS/RKRT/DKS/dead-band/music flags, but actuation and rapid trigger via
+  `0x21 / 0x18` **do** work (those flags are other features).
+- Actuation range 0.10–3.40 mm in 0.01 mm steps (config reply `54 01 01 01 0A`). Stock setting on
+  all 61 keys: actuation 1.70 mm, rapid trigger on (mode `0x0C`), sensitivity 0.51 mm.
 - **No side light strip**: the side-light mode list (`0x02`) is empty. Only key lighting is shown.
 - 14 lighting effects: Wave, Breathing, Neon, Twinkle, Radar, Static, Auto ripple, Striation,
   Reactive, Laser, Cross, Action response, Drip, Ripple. Brightness and speed 0–4.
@@ -27,12 +29,14 @@ moves. `PROTOCOL.md` is the full protocol reference; this file holds context, ru
 cargo run --release                          # the app
 cargo run --bin fizz-probe                   # read-only diagnostics, prints every packet
 cargo run --bin fizz-probe -- --rewrite-keymap   # backs up both layers, writes them back unchanged, verifies
+cargo run --bin fizz-probe -- --rewrite-triggers # same for every key's actuation settings
 cargo test                                   # unit tests (protocol + keymap)
 cargo clippy --all-targets                   # 1 expected warning, in src/graphite.rs (see below)
 ```
 
-Dev-only env vars for screenshots (not persisted): `FIZZ_PAGE=keys|lighting|packets|settings`,
-`FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps), `FIZZ_LAYER=fn`.
+Dev-only env vars for screenshots (not persisted): `FIZZ_PAGE=keys|actuation|lighting|packets|settings`,
+`FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps, 22 = Esc; key mapping and actuation),
+`FIZZ_LAYER=fn`.
 
 Screenshot the running app: `powershell -File tools/screenshot.ps1 -Title "Fizz control" -Out x.png`.
 Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture, `Stop-Process`.
@@ -42,11 +46,13 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Path | What |
 |---|---|
 | `src/protocol.rs` | Pure packet builders/parsers, no I/O. Unit-tested. Blocked-command list lives here. |
-| `src/device.rs` | `Keyboard`: open by VID/PID/usage page, send/recv, `request`, `request_pages`, `read_keymap`, `write_keymap` (acks + storing wait + read-back), `wait_until_stored`. |
+| `src/device.rs` | `Keyboard`: open by VID/PID/usage page, send/recv, `request`, `request_pages`, `read_keymap`, `write_keymap` (acks + storing wait + read-back), `wait_until_stored`, `read_trigger_config`, `read_key_triggers`, `write_key_triggers` (grouped + read-back). |
 | `src/keymap.rs` | Key catalogue (English names, wire order) and the 61-key `LAYOUT` with default actions. |
 | `src/worker.rs` | Background thread owning the connection: reconnect every 1 s, muted status heartbeat every 2 s, `Request` in / `Update` out, `read_snapshot`. |
 | `src/app.rs` | Window shell (sidebar, toolbar), Overview, Lighting, Packet log, Settings pages. |
-| `src/keymap_page.rs` | Key mapping page: keyboard drawing, layer switch, picker, save. |
+| `src/keymap_page.rs` | Key mapping page: layer switch, picker, save. |
+| `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
+| `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
 | `src/graphite.rs` | Copy of the Graphite egui theme module plus local additions (see Design). |
 | `src/bin/fizz-probe.rs` | CLI diagnostics and the key-map write-back test. |
 | `tools/decode_app.py` | Decrypt + de-obfuscate the vendor `app.js` statically. |
@@ -119,6 +125,13 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
   Slot `[kind, code, arg1, arg2]`; kinds in `keymap::kind`. Mouse (`0x12`) is byte-swapped on the wire.
   **Write verified on the real keyboard 2026-11-24**: 10/10 pages acked, read-back identical,
   storing flag never seen (save finishes within the 250 ms settle).
+- Actuation `0x21 [4]=0x18`: config `[5]=4` → `[6]|[9]<<8` max steps, `[7]` unit (÷100, or ÷1000 if
+  high-precision), `[8]` RT unit, `[10]` min steps. Per key `[5]=5 [6]=row [7]=col` → mode `[6]`,
+  travel `[7]|[11]<<8`, press `[9]|[13]<<8`, release `[10]|[14]<<8`, echoes row/col at `[15]`/`[16]`.
+  Write: `[5]=mode`, 22-byte column bitmap at `[6..28]` (bit = row), then `t t p r` low bytes and
+  `t t p r` high bytes at `[28..36]`. One packet sets any number of keys; no ack, so read back.
+  Modes: `0` fixed, `0x0C` RT single sensitivity (release = press), `0x0D` RT split, `0x01` legacy RT.
+  **No-op write verified 2026-11-24** (1 packet for all 61 keys, read-back identical).
 - Vendor app sources: `https://www.illumipc.com/app.js` (`WMJ1` + XOR `witmod-app-0x5a`);
   configs under `/config/` (`WMX1:` base64 XOR `witmod-config-0x5a`). Layout file for this board:
   `config/keys/7153USHEXYXACPARGB.json`.
@@ -133,6 +146,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Device overview (name, firmware, build date, product code, serial, poll rate, calibration, features) | Done, read |
 | Key lighting (effect, brightness, speed, rainbow, colours, direction) | Done. Read verified; **write not yet confirmed by Gert on the device** |
 | Key mapping, default + Fn layers | Done. Read verified; write path verified with a no-op write. A real remap via the GUI's Save button not yet tried |
+| Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
 | Packet log | Done |
 | Theme setting (System/Dark/Light, persisted) | Done |
 | Hot-plug reconnect / unplug detection | Built; unplug detection untested |
@@ -140,12 +154,14 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 
 ## Roadmap (in order)
 
-1. **Actuation and rapid trigger.** Decode the payloads of `0x21 [4]=0x18`: `[5]=4` global config,
-   `[5]=5 row col` per-key data, write = payload at byte 5, `[5]=6` reset, `[5]=2/3` live travel test,
-   `[5]=7/8/0x0F/0x10` calibration. Look at `getTriggerConfig`, `readTriggerData`, `setTrigger` and
-   the `triggerData`/`perKeyTrigger`/`triggerConfig` input events in the decoded JS. Probe read-only,
-   then a page reusing the keyboard drawing (select keys → actuation slider, RT on/off, sensitivity),
-   plus the live travel view. Key index here is `22*row + col`.
+1. ~~Actuation and rapid trigger~~ done 2026-11-24. Follow-ups, in order:
+   - **Live travel test**: `[5]=2` + 22-byte key bitmap at `[6]` starts it, `[5]=3` stops; the keyboard
+     then pushes `0x21 [5]=1` packets: row `[6]`, col `[7]`, travel `[8]|[9]<<8` (steps). Show a live
+     bar per key on the drawing. Needs the worker to forward unsolicited packets.
+   - **Calibration**: `[5]=8 [6]=0/1` start/stop all keys, `[5]=7 row col` one key, `[5]=0x0F/0x10`
+     "any key"; progress arrives as `0x21 [5]=7/8/0x0F` with `[6]` 0 success, 1 progress (bitmap at
+     `[7..0x1D]`), 2/4 failed. Treat as behaviour-changing: ask Gert first.
+   - Reset to defaults `[5]=6` (unknown defaults; ask first). Presets/quick buttons (e.g. "Gaming 0.4 mm").
 2. **Polling rate setting.** One write (`0x21 [5]=9 [6]=1 [7]=1|2|4|8`), segmented control on Overview.
 3. **Per-key RGB.** `0x09`: read `[1]=0x80/0x81` (two layers), write `[1]=layer`, pages 0–7 of
    54 bytes (18 keys × RGB, index = `18*page + i`), ack `[0]=9,[1]=layer`. "Custom" effect = mode 10.

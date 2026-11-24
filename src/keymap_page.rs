@@ -4,18 +4,15 @@
 use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
-use egui::{Align, Layout, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Align, Layout, ScrollArea, Ui, Vec2};
 use lucide_icons::Icon;
 
-use fizz::keymap::{self, CATALOGUE, Group, LAYOUT, LAYOUT_SIZE, PhysKey};
+use fizz::keymap::{self, CATALOGUE, Group, LAYOUT, PhysKey};
 use fizz::protocol::{KeyAction, Layer};
 
-use crate::graphite::{self, Tone, Type, radius, size, space};
+use crate::graphite::{self, Tone, Type, size, space};
+use crate::keyboard_view::{KeyFace, keyboard_view};
 use crate::worker::{Request, Snapshot};
-
-/// Largest drawing scale, so the keyboard doesn't get cartoonishly big on a
-/// wide window. Layout units are about 1 px per unit at scale 1.
-const MAX_SCALE: f32 = 1.6;
 
 pub enum Outcome {
     None,
@@ -227,74 +224,25 @@ impl KeymapPage {
         stored: Option<&[KeyAction]>,
     ) -> Option<usize> {
         let p = graphite::palette(ui);
-        let width = ui.available_width();
         // Leave at least half the height for the picker below.
-        let scale = (width / LAYOUT_SIZE.0)
-            .min(ui.available_height() * 0.5 / LAYOUT_SIZE.1)
-            .min(MAX_SCALE);
-        let (area, _) = ui.allocate_exact_size(
-            Vec2::new(width, LAYOUT_SIZE.1 * scale),
-            Sense::hover(),
-        );
-        // Centre the drawing when it's narrower than the page.
-        let origin = area.left_top() + Vec2::new((width - LAYOUT_SIZE.0 * scale) / 2.0, 0.0);
-        let mut clicked = None;
-
-        for key in LAYOUT {
-            let rect = Rect::from_min_size(
-                origin + Vec2::new(key.x, key.y) * scale,
-                Vec2::new(key.w, key.h) * scale,
-            );
-            let id = ui.scope_id().with(("key", key.slot));
-            let response = ui.interact(rect, id, Sense::click());
-            if response.clicked() {
-                clicked = Some(key.slot);
-            }
-
-            let action = keys[key.slot];
-            let selected = self.selected == Some(key.slot);
-            let unsaved = stored.is_some_and(|s| s[key.slot] != action);
-            let (text, color) = key_caption(layer, key, action, p);
-
-            let fill = if selected {
-                p.accent_subtle
-            } else if response.hovered() {
-                p.hover
-            } else {
-                p.surface
-            };
-            let stroke = if selected || response.has_focus() {
-                Stroke::new(size::BORDER, p.accent)
-            } else if response.hovered() {
-                Stroke::new(size::BORDER, p.border_strong)
-            } else {
-                Stroke::new(size::BORDER, p.border)
-            };
-            let painter = ui.painter();
-            painter.rect(rect, radius::MD, fill, stroke, StrokeKind::Inside);
-
-            let galley = painter.layout(
-                text,
-                Type::Caption.font(),
-                color,
-                rect.width() - space::S2 * 2.0,
-            );
-            let pos = rect.center() - galley.size() / 2.0;
-            painter.galley(pos, galley, color);
-
-            if unsaved {
-                // 8px status dot marking an unsaved change.
-                painter.circle_filled(
-                    rect.right_top() + Vec2::new(-space::S3, space::S3),
-                    space::S2,
-                    p.accent,
-                );
-            }
-            response
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("{}: {}", key.label, describe_in(layer, action)));
-        }
-        clicked
+        keyboard_view(
+            ui,
+            "keymap",
+            0.5,
+            |slot| self.selected == Some(slot),
+            |key| {
+                let action = keys[key.slot];
+                let (main, main_color) = key_caption(layer, key, action, p);
+                KeyFace {
+                    top: String::new(),
+                    main,
+                    main_color,
+                    unsaved: stored.is_some_and(|s| s[key.slot] != action),
+                    tooltip: format!("{}: {}", key.label, describe_in(layer, action)),
+                }
+            },
+        )
+        .map(|click| click.slot)
     }
 
     fn inspector(&mut self, ui: &mut Ui, layer: Layer, keys: &[KeyAction]) {

@@ -153,6 +153,23 @@ After writing key maps, poll `0x01` until the "storing" bit (`s[17]` bit 1, i.e.
 * Layout and key names come from `https://www.illumipc.com/config/keys/7153USHEXYXACPARGB.json` and
   `config/keys.json` (plain JSON; files prefixed `WMX1:` are base64 XOR `witmod-config-0x5a`).
 
+## Actuation and rapid trigger (`0x21`, `[4]=0x18`), confirmed on the real keyboard
+
+* **Config** `[5]=4` → reply `21 00 00 00 06 04 54 01 01 01 0A`: max steps `[6] | [9]<<8` = 340,
+  unit `[7]` = 1 → 0.01 mm (÷100; ÷1000 when the status high-precision flag is set; 0 means 10),
+  RT unit `[8]` = 0.01 mm, min steps `[10]` = 10. So actuation is 0.10–3.40 mm in 0.01 mm steps.
+* **Per key** `[5]=5 [6]=row [7]=col` → `[6]` mode, travel `[7] | [11]<<8`, press `[9] | [13]<<8`,
+  release `[10] | [14]<<8`, and the reply echoes row/col at `[15]`/`[16]`. `[8]` and `[12]` repeat travel.
+  Stock on every key: `0C AA AA 33 33` = rapid trigger, 1.70 mm, 0.51 mm / 0.51 mm.
+* **Write** (no reply): `[5]` = mode, `[6..28]` = 22 column bytes, bit *n* = row *n* selects the keys,
+  `[28..36]` = travel lo, travel lo, press lo, release lo, travel hi, travel hi, press hi, release hi.
+  One packet applies one setting to any set of keys. Verified 2026-11-24 by writing every key's
+  settings back unchanged (`fizz-probe --rewrite-triggers`): one packet, all 61 keys read back identical.
+* **Modes**: `0x00` fixed actuation; `0x0C` rapid trigger with one sensitivity (vendor app sets
+  release = press); `0x0D` rapid trigger with separate press/release; `0x01` older rapid trigger.
+* Not built yet: `[5]=6` reset, `[5]=2/3` live travel test (pushes `0x21 [5]=1` row, col, travel),
+  calibration `[5]=7/8/0x0F/0x10` (pushes progress as `0x21 [5]=7/8/0x0F`).
+
 ## Safe first tests
 
 Read-only, no side effects: `0x01` status, `0x0D` product info, `0x15` serial, `0x07 [1]=1` read lighting.

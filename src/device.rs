@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 
-use crate::protocol::{self, KeyAction, Layer, PACKET_LEN, Packet};
+use crate::protocol::{self, KeyAction, KeyTrigger, Layer, PACKET_LEN, Packet, TriggerConfig};
 
 pub const VENDOR_ID: u16 = 0x2E3C;
 /// `C365` is the normal mode; `C366`/`C367` are the gamepad modes and `C368`
@@ -78,6 +78,17 @@ pub struct KeymapWrite {
     /// The layer as read back after saving; `None` if the read-back was incomplete.
     pub stored: Option<Vec<KeyAction>>,
     /// True when the read-back matches exactly what was written.
+    pub verified: bool,
+}
+
+/// Pause between trigger write packets, which the keyboard doesn't acknowledge.
+const TRIGGER_WRITE_GAP: Duration = Duration::from_millis(30);
+
+/// Result of [`Keyboard::write_key_triggers`].
+#[derive(Clone, Debug)]
+pub struct TriggerWrite {
+    /// Each written slot with what the keyboard reports back (`None` if it didn't answer).
+    pub stored: Vec<(usize, Option<KeyTrigger>)>,
     pub verified: bool,
 }
 
@@ -315,6 +326,69 @@ impl Keyboard {
             storing_seen,
             verified: stored.as_deref() == Some(keys),
             stored,
+        })
+    }
+
+    /// Actuation range and step size.
+    pub fn read_trigger_config(&mut self, high_precision: bool) -> Result<Option<TriggerConfig>> {
+        let reply = self.request(
+            "trigger config",
+            &protocol::trigger_config_request(),
+            |r| r[0] == protocol::cmd::PROFILE_TRIGGER && r[5] == 0x04,
+            REPLY_TIMEOUT,
+        )?;
+        Ok(protocol::parse_trigger_config(&reply, high_precision))
+    }
+
+    /// Actuation settings of each key in `slots`, in the same order. The
+    /// reply echoes the key's row and column; a mismatch counts as missing.
+    pub fn read_key_triggers(&mut self, slots: &[usize]) -> Result<Vec<Option<KeyTrigger>>> {
+        let mut out = Vec::with_capacity(slots.len());
+        for &slot in slots {
+            let row = (slot / protocol::TRIGGER_COLS) as u8;
+            let col = (slot % protocol::TRIGGER_COLS) as u8;
+            let reply = self.request(
+                "key trigger",
+                &protocol::key_trigger_request(slot),
+                |r| {
+                    r[0] == protocol::cmd::PROFILE_TRIGGER
+                        && r[5] == 0x05
+                        && r[15] == row
+                        && r[16] == col
+                },
+                REPLY_TIMEOUT,
+            );
+            match reply {
+                Ok(r) => out.push(protocol::parse_key_trigger(&r)),
+                Err(Error::Timeout(_)) => out.push(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write actuation settings, one packet per distinct setting, then read
+    /// every written key back. `verified` is true when all match.
+    pub fn write_key_triggers(
+        &mut self,
+        groups: &[(KeyTrigger, Vec<usize>)],
+    ) -> Result<TriggerWrite> {
+        for (trigger, slots) in groups {
+            if !slots.is_empty() {
+                self.write_only(&protocol::key_trigger_write(trigger, slots))?;
+                std::thread::sleep(TRIGGER_WRITE_GAP);
+            }
+        }
+        let slots: Vec<usize> = groups.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        let stored = self.read_key_triggers(&slots)?;
+        let verified = groups
+            .iter()
+            .flat_map(|(t, s)| s.iter().map(move |_| *t))
+            .zip(&stored)
+            .all(|(want, got)| *got == Some(want));
+        Ok(TriggerWrite {
+            stored: slots.into_iter().zip(stored).collect(),
+            verified,
         })
     }
 

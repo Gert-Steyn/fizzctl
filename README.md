@@ -17,12 +17,13 @@ Read-only connection test that prints every packet:
 cargo run --bin fizz-probe
 ```
 
-Test the key-map save path without changing anything. It backs up both layers
-to `backups/`, writes them back unchanged and checks the keyboard still holds
-the same bytes:
+Test the save paths without changing anything. Each command backs up what the
+keyboard holds to `backups/`, writes it back unchanged and checks the keyboard
+still holds the same values (key map, then actuation):
 
 ```powershell
 cargo run --bin fizz-probe -- --rewrite-keymap
+cargo run --bin fizz-probe -- --rewrite-triggers
 ```
 
 ## What works
@@ -33,8 +34,18 @@ cargo run --bin fizz-probe -- --rewrite-keymap
 | Polling rate, calibration state, supported features | Read |
 | Key lighting: effect, brightness, speed, rainbow, colours, direction | Read and write |
 | Key mapping, default and Fn layers: keys, media, mouse, shortcuts, lighting controls | Read and write |
+| Actuation point and rapid trigger, per key or many keys at once | Read and write |
 | Packet log of all traffic | Yes |
-| Macros, actuation / rapid trigger, per-key RGB | Protocol mapped in `PROTOCOL.md`, not built yet |
+| Macros, per-key RGB, live travel test, calibration | Protocol mapped in `PROTOCOL.md`, not built yet |
+
+### Actuation
+
+Every key shows its actuation point in mm; accent numbers have rapid trigger on.
+Click a key, Ctrl-click several, or **Select all**, then set the actuation
+point, rapid trigger, and its sensitivity (one value, or separate press and
+release). Only the settings you change are applied to the selected keys.
+**Save actuation** sends one packet per distinct setting and reads every
+changed key back to check it.
 
 ### Key mapping
 
@@ -78,7 +89,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Developer overrides
 
-`FIZZ_PAGE` (`keys`, `lighting`, `packets`, `settings`) picks the start page,
+`FIZZ_PAGE` (`keys`, `actuation`, `lighting`, `packets`, `settings`) picks the start page,
 `FIZZ_THEME` (`dark`, `light`) forces a theme without saving it, and on the
-key mapping page `FIZZ_KEY` (a slot number, e.g. `66` for Caps) preselects a
-key and `FIZZ_LAYER=fn` opens the Fn layer. All are for screenshots.
+key mapping and actuation pages `FIZZ_KEY` (a slot number, e.g. `66` for Caps)
+preselects a key and `FIZZ_LAYER=fn` opens the Fn layer. All are for screenshots.

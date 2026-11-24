@@ -4,11 +4,13 @@
 //! ```text
 //! cargo run --bin fizz-probe
 //! cargo run --bin fizz-probe -- --rewrite-keymap
+//! cargo run --bin fizz-probe -- --rewrite-triggers
 //! ```
 //!
 //! `--rewrite-keymap` tests the key-map save path without changing anything:
 //! it backs up both layers to `backups/`, writes each one back unchanged, and
 //! checks that the keyboard still holds exactly the same bytes.
+//! `--rewrite-triggers` does the same for every key's actuation settings.
 
 use std::time::Duration;
 
@@ -41,6 +43,10 @@ fn main() {
 
     if std::env::args().any(|a| a == "--rewrite-keymap") {
         let ok = rewrite_keymap(&mut kb);
+        std::process::exit(if ok { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--rewrite-triggers") {
+        let ok = rewrite_triggers(&mut kb);
         std::process::exit(if ok { 0 } else { 2 });
     }
     kb.on_packet = Some(Box::new(|dir, packet| {
@@ -96,6 +102,77 @@ fn main() {
     ) {
         Ok(r) => println!("  {:?} Hz", p::parse_poll_rate(&r)),
         Err(e) => println!("  {e}"),
+    }
+
+    println!("\nActuation config");
+    let high_precision = kb
+        .request_same("status", &p::status_request(), TIMEOUT)
+        .ok()
+        .and_then(|r| p::parse_status(&r))
+        .is_some_and(|s| s.support.high_precision);
+    let config = match kb.request(
+        "trigger config",
+        &p::trigger_config_request(),
+        |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x04,
+        TIMEOUT,
+    ) {
+        Ok(r) => {
+            let c = p::parse_trigger_config(&r, high_precision);
+            println!("  {c:?}");
+            if let Some(c) = c {
+                println!(
+                    "  actuation range {:.2}–{:.2} mm in {:.2} mm steps",
+                    c.mm(c.min_steps),
+                    c.mm(c.max_steps),
+                    c.unit_mm
+                );
+            }
+            c
+        }
+        Err(e) => {
+            println!("  {e}");
+            None
+        }
+    };
+
+    println!("\nPer-key actuation (quiet: first and last few keys printed raw)");
+    let quiet = kb.on_packet.take();
+    let mut summary = std::collections::BTreeMap::<p::KeyTrigger, Vec<&str>>::new();
+    let mut raw_shown = 0;
+    for key in fizz::keymap::LAYOUT {
+        match kb.request(
+            "key trigger",
+            &p::key_trigger_request(key.slot),
+            |r| r[0] == p::cmd::PROFILE_TRIGGER && r[5] == 0x05,
+            TIMEOUT,
+        ) {
+            Ok(r) => {
+                if raw_shown < 3 || key.slot == 120 {
+                    println!("    {:>6} << {}", key.label, p::hex(&r[..20]));
+                    raw_shown += 1;
+                }
+                if let Some(t) = p::parse_key_trigger(&r) {
+                    summary.entry(t).or_default().push(key.label);
+                }
+            }
+            Err(e) => println!("  {}: {e}", key.label),
+        }
+    }
+    kb.on_packet = quiet;
+    for (t, keys) in &summary {
+        let mm = |s: u16| config.map(|c| format!("{:.2} mm", c.mm(s))).unwrap_or_default();
+        println!(
+            "  mode {:#04x} travel {} ({}) press {} ({}) release {} ({}): {} keys {:?}",
+            t.mode,
+            t.travel,
+            mm(t.travel),
+            t.press,
+            mm(t.press),
+            t.release,
+            mm(t.release),
+            keys.len(),
+            if keys.len() > 8 { &keys[..8] } else { &keys[..] }
+        );
     }
 
     for layer in [p::Layer::Default, p::Layer::Fn] {
@@ -238,6 +315,61 @@ fn rewrite_keymap(kb: &mut Keyboard) -> bool {
             }
         }
     }
+    println!("\n{}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Write every key's actuation settings back unchanged and verify.
+fn rewrite_triggers(kb: &mut Keyboard) -> bool {
+    let slots: Vec<usize> = fizz::keymap::LAYOUT.iter().map(|k| k.slot).collect();
+    println!("\nReading actuation for {} keys", slots.len());
+    let before = match kb.read_key_triggers(&slots) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  {e}, stopping without writing anything");
+            return false;
+        }
+    };
+    if before.iter().any(Option::is_none) {
+        println!("  some keys didn't answer, stopping without writing anything");
+        return false;
+    }
+    let before: Vec<p::KeyTrigger> = before.into_iter().flatten().collect();
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = format!("backups/triggers-{stamp}.txt");
+    let mut text = String::from("# Fizz actuation backup: slot mode travel press release (steps)\n");
+    for (slot, t) in slots.iter().zip(&before) {
+        text.push_str(&format!("{slot} {:#04x} {} {} {}\n", t.mode, t.travel, t.press, t.release));
+    }
+    if let Err(e) = std::fs::create_dir_all("backups").and_then(|_| std::fs::write(&path, text)) {
+        println!("  couldn't write the backup ({e}), stopping without writing anything");
+        return false;
+    }
+    println!("  backup saved to {path}");
+
+    let mut groups: Vec<(p::KeyTrigger, Vec<usize>)> = Vec::new();
+    for (slot, t) in slots.iter().zip(&before) {
+        match groups.iter_mut().find(|(g, _)| g == t) {
+            Some((_, s)) => s.push(*slot),
+            None => groups.push((*t, vec![*slot])),
+        }
+    }
+    println!("\nWriting {} setting group(s) back unchanged", groups.len());
+    let ok = match kb.write_key_triggers(&groups) {
+        Ok(r) => {
+            let missing = r.stored.iter().filter(|(_, t)| t.is_none()).count();
+            println!("  read-back matches {}, keys not answering {missing}", r.verified);
+            r.verified
+        }
+        Err(e) => {
+            println!("  write failed: {e}");
+            false
+        }
+    };
     println!("\n{}", if ok { "PASS" } else { "FAIL" });
     ok
 }

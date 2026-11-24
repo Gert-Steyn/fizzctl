@@ -1,0 +1,5 @@
+# Let logged-in users talk to the Redragon Fizz Magnetic Plus config interface.
+# Install:  sudo cp linux/99-fizz.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then unplug and replug the keyboard.
+KERNEL=="hidraw*", ATTRS{idVendor}=="2e3c", ATTRS{idProduct}=="c36[5-8]", MODE="0660", TAG+="uaccess"

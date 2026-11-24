@@ -1,0 +1,28 @@
+[package]
+name = "fizz-control"
+version = "0.1.0"
+edition = "2024"
+description = "Local configuration tool for the Redragon Fizz Magnetic Plus keyboard"
+default-run = "fizz-control"
+
+[lib]
+name = "fizz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fizz-control"
+path = "src/main.rs"
+
+[[bin]]
+name = "fizz-probe"
+path = "src/bin/fizz-probe.rs"
+
+[dependencies]
+hidapi = "2"
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit", "clipboard", "links", "persistence"] }
+egui = { version = "0.37.0", default-features = false }
+lucide-icons = "1.71.0"
+serde = { version = "1", features = ["derive"] }
+
+[profile.dev.package."*"]
+opt-level = 2

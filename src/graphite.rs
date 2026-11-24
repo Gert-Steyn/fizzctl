@@ -827,7 +827,9 @@ pub fn banner(ui: &mut Ui, tone: Tone, glyph: char, message: &str) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(icon(glyph).color(fg));
-                ui.label(text(message, Type::Body).color(p.text));
+                // `horizontal` doesn't wrap by default, and a long message
+                // would stretch the whole page past the window edge.
+                ui.add(egui::Label::new(text(message, Type::Body).color(p.text)).wrap());
             });
         });
 }

@@ -841,6 +841,10 @@ impl FizzApp {
 impl eframe::App for FizzApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_updates();
+        // A macro recording belongs to the Macros page: end it if we leave.
+        if self.page != Page::Macros {
+            self.macros.stop_recording();
+        }
         let dark = ui.visuals().dark_mode;
 
         egui::Panel::left("sidebar")

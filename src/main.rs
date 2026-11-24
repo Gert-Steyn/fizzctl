@@ -2,6 +2,7 @@
 
 mod actuation_page;
 mod app;
+mod capture;
 mod keyboard_view;
 mod keymap_page;
 mod macros_page;

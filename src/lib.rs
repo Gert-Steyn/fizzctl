@@ -7,3 +7,4 @@
 pub mod device;
 pub mod keymap;
 pub mod protocol;
+pub mod recorder;

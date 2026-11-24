@@ -40,9 +40,9 @@ cargo run --bin fizz-probe -- --rewrite-socd
 | Key mapping, default and Fn layers: keys, media, mouse, shortcuts, lighting controls | Read and write |
 | Actuation point and rapid trigger, per key or many keys at once | Read and write |
 | Snap tap (SOCD): on/off and up to 20 key pairs with 4 modes | Read and write |
-| Macros: 10 macros of key presses and clicks with delays, 4 play modes, assigned to keys via Key mapping | Read and write |
+| Macros: 10 macros of key presses and clicks with delays, 4 play modes, assigned to keys via Key mapping; record steps by typing | Read and write |
 | Packet log of all traffic | Yes |
-| Calibration, macro recording | Not built yet |
+| Calibration | Not built yet |
 | Live travel test | Blocked: starting it made the keyboard reset (see `PROTOCOL.md`) |
 
 ### Actuation
@@ -53,6 +53,17 @@ point, rapid trigger, and its sensitivity (one value, or separate press and
 release). Only the settings you change are applied to the selected keys.
 **Save actuation** sends one packet per distinct setting and reads every
 changed key back to check it.
+
+### Macros
+
+Pick a macro slot, create it, then add steps by hand or press **Record keys**
+and type: every key you press in this window is added to the end of the
+steps, with the pauses you make (or a fixed delay, your choice). Shift, Ctrl
+and Alt are recorded as the left or right key you used, and any key still held
+when you stop is released for you. Recording ends when you press **Stop
+recording**, pick another macro or page, switch to another window, or reach 40
+steps. The Windows key can't be recorded; use **Add key press** for it.
+**Save macros** writes all 10 macros at once.
 
 ### Key mapping
 
@@ -72,6 +83,7 @@ only key lighting is shown.
 - `src/protocol.rs`: packet builders and parsers, no I/O, unit-tested
 - `src/device.rs`: opens the vendor HID interface (usage page `0xFF1B`) and does request/reply
 - `src/worker.rs`: background thread that owns the connection, reconnects and sends heartbeats
+- `src/recorder.rs` and `src/capture.rs`: macro recording (event-to-step logic, and egui keys to HID codes)
 - `src/keymap.rs`: the key catalogue (English names) and this keyboard's 61-key layout
 - `src/app.rs`: the window; `src/keymap_page.rs`: the key mapping page; `src/graphite.rs`: the shared theme module
 - `PROTOCOL.md`: the reverse-engineered protocol
@@ -97,7 +109,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## Developer overrides
 
-`FIZZ_PAGE` (`keys`, `actuation`, `socd`, `macros`, `lighting`, `packets`, `settings`) picks the start page,
+`FIZZ_PAGE` (`keys`, `actuation`, `socd`, `macros`, `lighting`, `packets`, `settings`),
+`FIZZ_RECORD=1` (start recording into macro 1) picks the start page,
 `FIZZ_THEME` (`dark`, `light`) forces a theme without saving it, and on the
 key mapping and actuation pages `FIZZ_KEY` (a slot number, e.g. `66` for Caps)
 preselects a key and `FIZZ_LAYER=fn` opens the Fn layer. All are for screenshots.

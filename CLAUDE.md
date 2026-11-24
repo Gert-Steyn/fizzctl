@@ -49,7 +49,8 @@ cargo clippy --all-targets                   # 1 expected warning, in src/graphi
 ```
 
 Dev-only env vars for screenshots (not persisted): `FIZZ_EFFECT=custom` (preview the Custom
-effect on the Lighting page), `FIZZ_MACRO_DEMO=1` (unsaved sample in macro slot 1),
+effect on the Lighting page), `FIZZ_MACRO_DEMO=1` (unsaved sample in macro slot 1), `FIZZ_RECORD=1` (start recording into
+macro slot 1; used by `tools/record_test.ps1`),
 `FIZZ_PAGE=keys|actuation|socd|macros|lighting|packets|settings`,
 `FIZZ_THEME=dark|light`, `FIZZ_KEY=<slot>` (e.g. 66 = Caps, 22 = Esc; key mapping and actuation),
 `FIZZ_LAYER=fn`.
@@ -70,6 +71,8 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `src/actuation_page.rs` | Actuation page: multi-select keys, actuation point, rapid trigger, save. |
 | `src/socd_page.rs` | Snap tap (SOCD) page: on/off (immediate), key pairs with modes, save. |
 | `src/macros_page.rs` | Macros page: 10 slots list + editor (play mode, steps, delays); saves all 10. Key mapping's picker offers defined macros. |
+| `src/recorder.rs` | Macro recorder core (egui-free, in the library): key-down/up events with timestamps become steps; keeps the macro valid (every press released, 40-step cap, releases owed reserved). `is_balanced` lives here. |
+| `src/capture.rs` | egui events to HID events for the recorder: `hid_code(egui::Key)`, `key_events` (reads `physical_key`, drops auto-repeat, turns `Copy`/`Cut`/`Paste` events back into C/X/V). |
 | `src/keyboard_view.rs` | Shared clickable keyboard drawing (`KeyFace` per key, Ctrl/Shift-click to extend). |
 | `src/graphite.rs` | Copy of the Graphite egui theme module plus local additions (see Design). |
 | `src/bin/fizz-probe.rs` | CLI diagnostics and the key-map write-back test. |
@@ -77,6 +80,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | `tools/decode_config.py` | Decode vendor `config/*.json` (`WMX1:` format). |
 | `tools/decode_i18n.py` | Extract the app's built-in (Chinese) UI strings (`witmod-i18n-0x7f`). |
 | `tools/screenshot.ps1` | Capture a window to PNG. |
+| `tools/record_test.ps1`, `tools/click.ps1` | UI tests with real input: type into the app (SendKeys) / click and scroll it, both only while it is the foreground window; screenshots after. |
 | `backups/` | Key-map backups from `--rewrite-keymap` (git-ignored). |
 
 ## Rules
@@ -126,12 +130,28 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 - `Ui::id()` is deprecated → `scope_id()`. App trait is `fn ui(&mut self, ui, frame)`; panels are
   `egui::Panel::left/top(..).show(ui, ..)`.
 - Give each page's `ScrollArea` an `id_salt`, or pages share (and persist) one scroll offset.
-- `Label::wrap()` to wrap long text (the packet log's hex lines).
+- `Label::wrap()` to wrap long text (the packet log's hex lines). Labels inside `ui.horizontal`
+  don't wrap by default: one long message stretched a whole column past the window edge (the
+  banner now wraps explicitly).
+- **Keyboard events (egui 0.37 / egui-winit):** `Event::Key` is emitted for *every* key including
+  lone Shift/Ctrl/Alt/Win with left/right (`Key::ShiftLeft`, ...), CapsLock, PrintScreen, Menu.
+  `physical_key` is the key position (what HID codes mean), `key` is logical-or-physical. Auto-repeat
+  has `repeat: true`. Ctrl+C/X/V (and on Windows Shift+Del, Ctrl+Insert, Shift+Insert) arrive as
+  `Event::Copy/Cut/Paste` with **no** key-down event (the key-up still arrives), so recording must
+  turn those back into C/X/V. Numpad digits arrive as top-row digits. To get Tab/arrows/Esc as
+  events instead of focus movement, keep focus on a `Sense::focusable_noninteractive()` widget
+  and call `memory.set_focus_lock_filter(id, EventFilter{..all true..})` every frame.
+- `Id::new` is deprecated; use `ui.make_persistent_id(salt)`.
 
 ## Tooling gotchas
 - PowerShell variables are **case-insensitive**: `$s` overwrites `$S`.
 - Bash heredocs through the tool can mangle backslashes (`'\\'`, `\n`). For scripts with
   backslashes, write a file with the Write tool and run it instead of inlining.
+- **Testing UI with real input** (PowerShell): `SendKeys.SendWait` works but its arrow keys lack
+  the extended flag, so Windows/winit see them as numpad 4/6/8/2; use `keybd_event(vk, scan, 0x1)`
+  (extended) for real arrows. Always check the foreground window title before sending input.
+  `AppActivate(pid)` + `SetForegroundWindow` brings the app forward; `MoveWindow` resizes it. The
+  screen work area is 1920x1032, so use mouse-wheel scrolling to see long pages.
 - Reading the vendor JS: never execute it; `tools/decode_app.py` works statically. Run Python on
   downloaded files with `python -I`.
 - hidapi on Windows prefixes input reports with the report ID (64 bytes); `Keyboard::recv` strips it.
@@ -213,7 +233,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 | Actuation + rapid trigger (per key, multi-select) | Done. Read verified; write path verified with a no-op write. A real change via the GUI not yet tried |
 | Polling rate (1/2/4/8 kHz on Overview, applies immediately) | Done. No-op write verified; a real change via the GUI not yet tried |
 | Per-key colours (Custom effect: paint keys on the Lighting page) | Done. Read verified; colour write verified (acks + read-back); lighting write verified via probe. Painting from the GUI not yet tried |
-| Macros: 10 slots, play modes, key/mouse steps with delays; assign via Key mapping | Done. Read verified; save path verified with the vendor-style all-slots write (test macro in, cleared again). Saving a real macro via the GUI and assigning it not yet tried. No recording yet |
+| Macros: 10 slots, play modes, key/mouse steps with delays; assign via Key mapping | Done. Read verified; save path verified with the vendor-style all-slots write (test macro in, cleared again). Recording keys by typing is done and was tested with real key presses (letters, Shift+A, Ctrl+C, Space, F5, Tab, Enter, arrows; held key + focus loss). Saving a real macro via the GUI and assigning it not yet tried |
 | Snap tap (SOCD): on/off, up to 20 pairs with 4 modes | Done. Read verified; no-op writes verified; a real change via the GUI not yet tried |
 | Live travel test | **Blocked** in the app: a 61-key start reset the keyboard; one key works (probe only) |
 | Packet log | Done |
@@ -230,8 +250,7 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
      heartbeat matters for the full set. If only small sets are safe, the UI can test the
      selected keys only. The worker must stream input (no `drain()`/heartbeat while testing) and
      always send `[5]=3` on stop, page change and shutdown. If it works: show a live
-     bar per key on the drawing; the worker must stream input (no `drain()`/heartbeat while testing)
-     and always send `[5]=3` on stop, page change and shutdown.
+     bar per key on the drawing.
    - **Calibration**: `[5]=8 [6]=0/1` start/stop all keys, `[5]=7 row col` one key, `[5]=0x0F/0x10`
      "any key"; progress arrives as `0x21 [5]=7/8/0x0F` with `[6]` 0 success, 1 progress (bitmap at
      `[7..0x1D]`), 2/4 failed. Treat as behaviour-changing: ask Gert first.
@@ -240,8 +259,13 @@ Launch with `Start-Process`, wait ~4–5 s for it to read the keyboard, capture,
 3. ~~Per-key RGB~~ done 2026-11-24 (edits the active colour layer only). Possible follow-ups:
    switch between the two colour layers (writing a layer activates it), drag-to-paint, presets.
 4. ~~SOCD~~ done 2026-11-24 (not originally on the list; found by the survey).
-5. ~~Macros~~ done 2026-11-24 (editor; save writes all 10 slots). Follow-up: **record** steps by
-   typing (egui reports no events for lone modifier keys, so Shift/Ctrl need special handling).
+5. ~~Macros~~ done 2026-11-24 (editor; save writes all 10 slots). ~~Recording~~ done 2026-11-24:
+   "Record keys" appends typed keys to the steps (Recorded pauses or Fixed delay), captures
+   left/right modifiers, stops on Stop / other slot / other page / losing window focus / 40 steps,
+   and releases keys still held. Limits: Windows key and keys the OS grabs can't be recorded
+   (use Add key press); mouse clicks aren't recorded (use Add click); Ctrl+Insert, Shift+Insert and
+   Shift+Delete are recorded as C, V and X; numpad digits as top-row digits. Possible follow-ups:
+   edit the key of an existing step, record mouse clicks, drag to reorder.
    Original notes: `0x19`: read slot `[1]=0x80+slot`, write `[1]=slot` 58-byte pages (256-byte buffer),
    delete `[1]=3 [4]=index`. Step = `{keyCode, type|state<<4, delayHi, delayLo}`. Key-map kind `0x10`
    with `arg1` = macro index. Needs a recorder UI.
